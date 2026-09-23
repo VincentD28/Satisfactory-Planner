@@ -1,0 +1,31 @@
+{
+ "options": {
+  "miners_mark": 1,
+  "conveyor_lvl": 1,
+  "pipe_lvl": 1,
+  "arrow_mode": "new",
+  "snap": true,
+  "picture_mode": "item",
+  "build_reveal": "skip",
+  "show_power": false,
+  "compact": false,
+  "locked": false,
+  "quick_done": false,
+  "recipe_choices": {},
+  "node_recipe_choices": []
+ },
+ "game_path": "C:/Program Files (x86)/Steam/steamapps/common/Satisfactory",
+ "window": [
+  2560,
+  1369
+ ],
+ "current": 0,
+ "projects": [
+  {
+   "name": "Project 1",
+   "color": "#2a2a2a",
+   "outputs": [],
+   "built": false
+  }
+ ]
+}
