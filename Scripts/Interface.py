@@ -411,8 +411,12 @@ def save_appdata(window):
                 "window": [window.width(), window.height()],
                 "current": window.current_project(),
                 "projects": [saved_project(page) for page in pages]}
-        with open(APPDATA_FILE, "w", encoding="utf-8") as file:
+        # written whole to a file of its own, then swapped in: a save cut off
+        # halfway leaves the old file standing rather than half of a new one
+        partial = APPDATA_FILE + ".tmp"
+        with open(partial, "w", encoding="utf-8") as file:
             json.dump(data, file, indent=1)
+        os.replace(partial, APPDATA_FILE)
     except Exception:
         pass   # a planner that cannot write its file still has a factory to draw
 
@@ -420,8 +424,16 @@ def read_appdata():
     try:
         with open(APPDATA_FILE, encoding="utf-8") as file:
             return json.load(file) or {}
+    except FileNotFoundError:
+        return {}   # nothing saved yet
     except Exception:
-        return {}   # nothing saved yet, or a file that is no longer readable
+        # a file that is no longer readable is put aside before the next save
+        # writes over it, so what it held can still be dug out by hand
+        try:
+            os.replace(APPDATA_FILE, APPDATA_FILE + ".unreadable")
+        except OSError:
+            pass
+        return {}
 
 # every change asks for a save and the last one within APPDATA_SAVE_DELAY does
 # it: a drag would otherwise write the file on every pixel of the way
@@ -4077,12 +4089,19 @@ def picture_icon(path, size):
         _picture_icons[key] = QIcon(picture_pixmap(path, size))
     return _picture_icons[key]
 
+# text worth copying out - a name, a rate, a count - can be picked up with the
+# mouse and copied, by Ctrl+C or the right click menu
+def selectable(label):
+    label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+    label.setCursor(Qt.IBeamCursor)
+    return label
+
 def info_label(text, color, size=NODE_INFO_TEXT_FONT_SIZE, bold=False, wrap=False):
     label = QLabel(text)
     label.setStyleSheet(f"color: {color}; font-size: {size}px; background: transparent;"
                         + (" font-weight: bold;" if bold else ""))
     label.setWordWrap(wrap)
-    return label
+    return selectable(label)
 
 # floating card of a node's info, hidden until a node is clicked open.
 # panel.set_node(node, values) fills it - the most useful numbers first, what
@@ -7601,7 +7620,7 @@ def make_output_row(item, recipe=None, on_recipe_change=None, start=None, on_rat
 
     picture = picture_label(card_picture(recipe), OUTPUT_PICTURE_SIZE)
 
-    label = QLabel(item.display_name)
+    label = selectable(QLabel(item.display_name))
     label.setStyleSheet(f"color: {OUTPUT_NAME_COLOR}; font-size: {PANEL_FONT_SIZE}px; font-weight: bold;")
 
     remove_button = make_remove_output_button()
@@ -8660,7 +8679,7 @@ def make_report_row(picture_path, name, count_text, detail=None, accent=None):
     if isinstance(name, QWidget):
         label = name
     else:
-        label = QLabel(name)
+        label = selectable(QLabel(name))
         # the right panel's option label and option value, to the letter
         label.setStyleSheet(f"color: {TAB_UNSELECTED_COLOR}; font-size: {PANEL_FONT_SIZE}px; background: transparent;")
     name_column = QVBoxLayout()
@@ -8669,11 +8688,11 @@ def make_report_row(picture_path, name, count_text, detail=None, accent=None):
     name_column.addWidget(label)
     if detail:
         # small, like the stat under an option's label, but quiet
-        detail_label = QLabel(detail)
+        detail_label = selectable(QLabel(detail))
         detail_label.setWordWrap(True)
         detail_label.setStyleSheet(f"color: {TEXT_FAINT}; font-size: {OPTION_STAT_FONT_SIZE}px; background: transparent;")
         name_column.addWidget(detail_label)
-    count = QLabel(count_text)
+    count = selectable(QLabel(count_text))
     count.setStyleSheet(f"color: {TAB_SELECTED_COLOR}; font-size: {PANEL_FONT_SIZE}px; background: transparent;")
     count.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
@@ -8779,8 +8798,8 @@ def make_recipes_page(on_change=None):
         if not entries:
             return
 
-        line = QLabel(f"{len(entries)} recipes, "
-                      f"{sum(1 for entry in entries if entry[0].is_alternate)} alternate")
+        line = selectable(QLabel(f"{len(entries)} recipes, "
+                      f"{sum(1 for entry in entries if entry[0].is_alternate)} alternate"))
         line.setStyleSheet(f"color: {TEXT_ACCENT}; font-size: {OPTION_STAT_FONT_SIZE}px;")
         body.addWidget(line)
         for recipe, machine, machine_nb, _, item, fed, inside, node, items in entries:
@@ -8848,7 +8867,7 @@ def make_details_page():
                 item.widget().deleteLater()
 
     def summary(text):
-        line = QLabel(text)
+        line = selectable(QLabel(text))
         line.setStyleSheet(f"color: {TEXT_ACCENT}; font-size: {OPTION_STAT_FONT_SIZE}px;")
         return line
 
