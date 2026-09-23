@@ -1,10 +1,9 @@
 # Builds dist/SatisfactoryPlanner.exe:  python build_exe.py
 #
 # Makes the exe's icon from Images/Gear_Logo.png (with Qt, so no Pillow needed),
-# runs PyInstaller on SatisfactoryPlanner.spec, then copies Data/ beside the exe
-# so the projects saved from the scripts open in the exe too.
+# then runs PyInstaller on SatisfactoryPlanner.spec. The exe keeps its projects
+# in AppData\Roaming\Satisfactory-Planner, shared with the scripts.
 import os
-import shutil
 import subprocess
 import sys
 
@@ -32,7 +31,6 @@ def main():
     subprocess.check_call([sys.executable, "-m", "PyInstaller", "--noconfirm",
                            "--distpath", DIST, "--workpath", os.path.join(BUILD, "pyinstaller"),
                            os.path.join(ROOT, "SatisfactoryPlanner.spec")])
-    shutil.copytree(os.path.join(ROOT, "Data"), os.path.join(DIST, "Data"), dirs_exist_ok=True)
     print("\nbuilt", os.path.join(DIST, "SatisfactoryPlanner.exe"))
 
 

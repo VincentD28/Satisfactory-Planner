@@ -2,15 +2,18 @@
 #
 # One windowed exe. The pictures and the cleaned game data ride inside it, where
 # data_maker.data_file() falls back to them (img/<name> and <name> under
-# sys._MEIPASS), so the exe runs on its own. What the planner writes - projects,
-# a rebuilt cleaned_data.json - goes to a Data folder made beside the exe.
+# sys._MEIPASS), so the exe runs on its own - even on a machine whose
+# AppData\Roaming\Satisfactory-Planner (data_maker.DATA) has no data yet.
 import glob
 import os
+import sys
 
 ROOT = os.path.abspath(SPECPATH)
+sys.path.insert(0, os.path.join(ROOT, "Scripts"))
+import data_maker
 
 datas = [(path, "img") for path in glob.glob(os.path.join(ROOT, "Images", "*"))]
-datas.append((os.path.join(ROOT, "Data", "cleaned_data.json"), "."))
+datas.append((os.path.join(data_maker.DATA, "cleaned_data.json"), "."))
 
 icon = os.path.join(ROOT, "build", "icon.ico")
 

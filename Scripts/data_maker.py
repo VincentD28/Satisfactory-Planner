@@ -17,20 +17,24 @@ import sys
 # the game installed, say.
 GAME_DOCS = r"C:\Program Files (x86)\Steam\steamapps\common\Satisfactory\CommunityResources\Docs\en-CA.json"
 
-# The planner keeps itself in three folders beside one another: Scripts (this
-# file and its two neighbours), Images (every picture the graph draws) and
-# Data (what the planner reads and writes - the cleaned game data, what it was
-# made from, and the projects). Everything here answers where those are.
+# The planner keeps itself in three folders: Scripts (this file and its two
+# neighbours), Images (every picture the graph draws) beside them, and Data
+# (what the planner reads and writes - the cleaned game data, what it was made
+# from, and the projects). Everything here answers where those are.
 #
-# Built into an exe it is the same three folders, beside the exe rather than
-# beside the scripts: PyInstaller unpacks the code into a temporary folder of
-# its own (sys._MEIPASS, gone the moment the app closes), so nothing the
-# planner writes can live there.
+# Data lives in the user's own AppData\Roaming\Satisfactory-Planner, not in the
+# project: the scripts and the exe then share one set of projects wherever the
+# exe is put, and none of it ends up on git.
+#
+# Built into an exe, Images is beside the exe rather than beside the scripts:
+# PyInstaller unpacks the code into a temporary folder of its own
+# (sys._MEIPASS, gone the moment the app closes), so nothing the planner writes
+# can live there.
 FROZEN = getattr(sys, "frozen", False)
 SCRIPTS = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(sys.executable) if FROZEN else os.path.dirname(SCRIPTS)
 IMAGES = os.path.join(ROOT, "Images")
-DATA = os.path.join(ROOT, "Data")
+DATA = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "Satisfactory-Planner")
 
 # a file the planner writes: in Data, which is made if it is not there yet
 def kept_file(name):
