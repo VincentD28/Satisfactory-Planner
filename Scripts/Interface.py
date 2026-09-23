@@ -10038,7 +10038,7 @@ DEFAULT_WINDOW_SIZE = (1200, 800)
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Calculator")
+        self.setWindowTitle("Satisfactory-Planner")
         # the options are read before anything is built: every panel and every
         # graph is drawn from them
         saved = read_appdata()
