@@ -60,8 +60,8 @@ def data_file(name):
 LOCAL_DOCS = os.path.join(DATA, "en-CA.json")
 
 # What the cleaned data was last built from, kept beside it: the file itself
-# and a fingerprint of its contents, so the app can tell whether the game has
-# been updated since (see Interface, the home page).
+# and a fingerprint of its contents and the game version it came with - what
+# the app's hub shows, and what the next run is compared against (see main).
 SOURCE_RECORD = kept_file("data_source.json")
 
 def fingerprint(path):
@@ -116,6 +116,48 @@ def remember_version(docs_path):
     except OSError:
         pass
     return record
+
+# ---- the game's own files, found and checked ----
+#
+# Where the game keeps the file this planner is built from, under whatever
+# was pointed at: the file itself, the Docs folder, the install, or the Steam
+# library above it. Whichever it is, the walk down to en-CA.json is the same.
+GAME_DOCS_TAIL = ("CommunityResources", "Docs", "en-CA.json")
+GAME_DOCS_FOLDERS = (
+    (),
+    ("Satisfactory",),
+    ("common", "Satisfactory"),
+    ("steamapps", "common", "Satisfactory"),
+)
+
+def find_game_docs(pointed_at):
+    pointed_at = (pointed_at or "").strip().strip('"')
+    if not pointed_at:
+        return ""
+    if os.path.isfile(pointed_at):
+        return pointed_at if pointed_at.lower().endswith(".json") else ""
+    if not os.path.isdir(pointed_at):
+        return ""
+    # the Docs folder itself, or anything above it down to the library root
+    for above in GAME_DOCS_FOLDERS:
+        whole = os.path.join(pointed_at, *above, *GAME_DOCS_TAIL)
+        if os.path.isfile(whole):
+            return whole
+    beside = os.path.join(pointed_at, "en-CA.json")
+    return beside if os.path.isfile(beside) else ""
+
+# whether the cleaned data in use was built from what `docs` holds now:
+# True, False, or None when there is nothing that can be compared
+def data_is_current(docs):
+    if not docs or not os.path.isfile(docs):
+        return None
+    record = source_record()
+    if not record.get("fingerprint"):
+        return False     # never built from a file that can be named
+    try:
+        return fingerprint(docs) == record["fingerprint"]
+    except OSError:
+        return None
 
 def original_data_path():
     if os.path.exists(LOCAL_DOCS):
@@ -406,6 +448,9 @@ def parse_machine_list(raw):
     return RECIPE_MACHINE_FORM.findall(raw)
 
 
+# what an unpackaging recipe hands back on the side of what was packaged
+PACKAGING_CONTAINERS = ("Desc_FluidCanister_C", "Desc_GasTank_C")
+
 def clean_data(source=None):
     # uses "ClassName" for key
     All_Items = {}
@@ -643,41 +688,45 @@ def clean_data(source=None):
 
     # -- Recipe display priority --
 
+        # An unpackaging recipe hands back two things: what was packaged and
+        # the canister or tank it was in. The first is what it is for, so it is
+        # its main product, the container on the side - whatever order the
+        # game's own file lists them in.
+        for name, recipe in All_Recipes.items():
+            if name.startswith("Recipe_Unpackage"):
+                recipe.products.sort(key=lambda entry: entry["item"] in PACKAGING_CONTAINERS)
+
         # Order each item's recipes the way the user should see them, the first
-        # being what the planner makes it with unless told otherwise. Three
+        # being what the planner makes it with unless told otherwise. Four
         # things decide it, in this order:
         #
-        #   - a recipe that eats the item as well as making it can never stand
-        #     on its own. Sulfuric acid's first recipe was Encased Uranium
-        #     Cell, which makes acid on the side while drinking four times as
-        #     much of it: asked for 20/min the planner climbed to hundreds of
-        #     billions of refineries and never settled. Last, always.
+        #   - unpackaging comes last, for everything it hands back - the item
+        #     that was packaged and the empty container alike. It is not a way
+        #     of making anything: packaging took the item itself, so as a
+        #     default it only ever loops between packing and unpacking - heavy
+        #     oil residue and turbofuel went round it until the solver gave up.
         #   - a recipe that makes the item only on the side comes after the
         #     ones it is the point of. Compacted coal came from the Rocket
-        #     Fuel recipe, which needs turbofuel, which needs compacted coal.
-        #   - then the kind: 0 extraction, 1 normal, 2 converter, 3 alternate,
-        #     4 unpackaging. Unpackaging is last because it makes nothing: it
-        #     hands back what was packaged. It was the default for four items -
-        #     empty canisters from unpackaging alumina, empty tanks from
-        #     unpackaging nitric acid, and rocket fuel and turbofuel by
-        #     unpackaging themselves.
+        #     Fuel recipe, which needs turbofuel, which needs compacted coal;
+        #     sulfuric acid from Encased Uranium Cell, which drinks four
+        #     times the acid it makes.
+        #   - an alternate comes after every recipe that is not one: the
+        #     planner starts from the game's own standard recipes, and an
+        #     alternate is used when picked, or when the item has nothing else.
+        #   - then the kind: 0 extraction, 1 normal, 2 converter.
         def recipe_kind(recipe_name):
             recipe = All_Recipes[recipe_name]
             if recipe_name.startswith("Extract_"):
                 return 0
-            if recipe_name.startswith("Recipe_Unpackage"):
-                return 4
             if "Build_Converter_C" in recipe.machine:
                 return 2
-            if recipe.is_alternate:
-                return 3
             return 1
 
         def recipe_priority(recipe_name, item_name):
             recipe = All_Recipes[recipe_name]
-            eats_it = any(entry["item"] == item_name for entry in recipe.ingredients)
+            unpacking = recipe_name.startswith("Recipe_Unpackage")
             on_the_side = recipe.products[0]["item"] != item_name
-            return (eats_it, on_the_side, recipe_kind(recipe_name))
+            return (unpacking, on_the_side, recipe.is_alternate, recipe_kind(recipe_name))
 
         for item in All_Items.values():
             item.recipes.sort(key=lambda name, item_name=item.full_name: recipe_priority(name, item_name))
@@ -715,5 +764,82 @@ def clean_data(source=None):
     return SOURCE_PATH_ORIGINAL_DATA
 
 
+# ---- run on its own ----
+#
+#   python data_maker.py                      the copy kept in Data, else the usual Steam install
+#   python data_maker.py "<where the game is>"
+#
+# Where the game is can be en-CA.json itself, its Docs folder, the game's
+# install folder or the Steam library above it (see find_game_docs). The data
+# is made again, and a summary printed of what it was made from and of how
+# that compares with what it was made from last time.
+
+SUMMARY_RULE = "=" * 64
+
+def summary_line(label, value):
+    print(f"  {label:<18}{value}")
+
+def describe_version(record):
+    if not record.get("version"):
+        return "unknown"
+    return record["version"] + (f"  (build {record['build']})" if record.get("build") else "")
+
+def print_summary(before, source):
+    after = source_record()
+    try:
+        with open(kept_file("cleaned_data.json"), encoding="utf-8") as file:
+            made = json.load(file)
+    except Exception:
+        made = {}
+    items = made.get("items", {})
+    recipes = made.get("recipes", {})
+    machines = made.get("machines", {})
+    fluids = sum(1 for item in items.values() if item.get("form") in ("RF_LIQUID", "RF_GAS"))
+
+    # how this run stands against the one before it
+    if not before.get("fingerprint"):
+        change = "first data made with a source on record"
+    elif before["fingerprint"] == after.get("fingerprint"):
+        change = "same file as last time - nothing new in it"
+    elif before.get("version") and after.get("version") and before["version"] != after["version"]:
+        change = f"game updated: {before['version']} -> {after['version']}"
+    elif os.path.normcase(before.get("path") or "") != os.path.normcase(after.get("path") or ""):
+        change = "read from a different file than last time"
+    else:
+        change = "the file has changed since last time"
+
+    print()
+    print(SUMMARY_RULE)
+    print("  Satisfactory-Planner game data")
+    print(SUMMARY_RULE)
+    summary_line("Read from", source)
+    summary_line("Game version", describe_version(after))
+    summary_line("Fingerprint", (after.get("fingerprint") or "?")[:16])
+    summary_line("Last time", f"{describe_version(before)}  -  {before.get('path') or 'nothing on record'}")
+    summary_line("Change", change)
+    summary_line("Items", f"{len(items)}  ({fluids} fluids)")
+    summary_line("Recipes", len(recipes))
+    summary_line("Machines", len(machines))
+    summary_line("Written to", kept_file("cleaned_data.json"))
+    summary_line("Source record", SOURCE_RECORD)
+    print(SUMMARY_RULE)
+
+def main(argv):
+    pointed = argv[1] if len(argv) > 1 else ""
+    docs = find_game_docs(pointed) if pointed else ""
+    if pointed and not docs:
+        print(f"No game data found under {pointed}")
+        print("Point to en-CA.json, its Docs folder, the Satisfactory install or the Steam library.")
+        return 1
+    before = source_record()
+    try:
+        source = clean_data(docs or None)
+    except FileNotFoundError as missing:
+        print(missing)
+        return 1
+    print_summary(before, source)
+    return 0
+
+
 if __name__ == "__main__":
-    clean_data()
+    sys.exit(main(sys.argv))

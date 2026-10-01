@@ -2,8 +2,33 @@
 # Date        : 12-08-2026
 
 # todo : 
-#      : exe
+#      : 
+#      : 
 
+#      : x the window's own title bar (Windows): taller, in the app's grey, gear + name, its own min/max/close (close goes red), native dragging/snapping/resizing kept
+#      : x node titles never cut a word: the name shrinks to the biggest size its longest word fits at, to the pixel
+#      : x hub and tabs live both ways: a card dragged on the hub moves the tabs as it goes, a tab dragged moves the cards
+#      : x output order in the panel follows the tree only when built with the button (dragged boxes, outline mode, a node's recipe or reopening leave it)
+#      : x 5 projects per row in the hub
+#      : x the gear app icon on the window (and the taskbar, run from the scripts too)
+#      : x game version centered in its tag, by its capitals and figures
+#      : x hub cards widen for their outputs, only as much as they need (up to 10 pictures, then "+n"), power lines climb in gaps clear of every card
+#      : x title "Satisfactory Planner"
+#      : x bigger dashes and gaps (output outlines, the hub's New project card)
+#      : x node info: a product going to an output wears its box's outline on its row (green top, dashed green top, dashed teal bottom), in both outputs modes
+#      : x color sampler: pipette beside the hex field, freezes every screen and takes the clicked pixel (other apps too; right click / Esc cancels)
+#      : x hex field under the color sliders (any color, black included; sliders follow it)
+#      : x open tab's name (and close cross) dark on a light tab color, light on a dark one
+#      : x name + color changed together in the rename box: confirmed together (Enter / tick), cancelled together (Escape / click away, color put back)
+#      : x tab pages: wheel turns a whole page, next/new page button after the "+", page numbers strip over the row (drop a tab on one to move it), all-rows mode button
+#      : x tabs as wide as their name (never cut) + names of letters/digits/space/-/_ only + 24 char limit + smaller tabs by default
+#      : x compact output view: picture + rate tiles, two to a row, order kept (button in the section heading)
+#      : x graph option bar folds down to its corner, full screen kept (remembered)
+#      : x option space only as tall as its rows + button to collapse it (remembered)
+#      : x below miner extraction node, the number of ore per min instead of the miner count (miner mark kept)
+#      : x dragging tabs (along the row) + dragging outputs (up and down their list, by the grip)
+#      : x default the rate for one machine output (follows the recipe until the rate is changed)
+#      : x allow fraction output with dot
 #      : x elec arrow moved to the node's top left, in its line's own green/red
 #      : x generator imgs added to img (the power card keeps the bolt)
 #      : x app and projects saved to appdata.json: outputs, node positions, options, camera
