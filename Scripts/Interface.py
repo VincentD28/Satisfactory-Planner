@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import (
     QPainter, QPainterPath, QPen, QBrush, QColor, QShortcut, QKeySequence, QIcon, QPixmap, QFont,
     QPolygonF, QTextOption, QImage, QFontMetrics, QFontMetricsF, QRegularExpressionValidator, QLinearGradient,
-    QTextCursor, QTextCharFormat, QCursor, QTransform, QPainterPathStroker
+    QTextCursor, QTextCharFormat, QCursor, QTransform, QPainterPathStroker, QRegion
 )
 from PySide6.QtCore import (
     Qt, QTimer, QPoint, QPointF, QSize, QSizeF, QObject, QEvent, QLineF, QRect, QRectF, QItemSelectionModel,
@@ -130,6 +130,7 @@ RECENTER_MS = 260
 CAMERA_AT_START_PX = 4       # how near the reset framing, on screen, still counts as at it
 CAMERA_AT_START_ZOOM = 0.01  # ...and how near its zoom, as a share of it
 MOVING_SETTLE_MS = 90       # how soon after the last move the view redraws in full
+FRAME_CACHE_IDLE_MS = 150   # how long the graph stands still before a picture of it is kept
 ROLL_MS = 180               # a card unrolling into its list, or rolling up out of it
 TOOLBAR_FOLD_MS = 200       # the graph's option bar folding down into its corner, or back up
 CARD_SLIDE_MS = 160         # a card sliding to its new spot: another dragged past it, a layout switched
@@ -175,11 +176,12 @@ def fade_out(widget, duration=ANIMATION_MS, on_done=None):
     animation.setStartValue(1.0)
     animation.setEndValue(0.0)
 
+    # hidden the moment it is faded out, whatever comes after: its effect
+    # comes off here, and left showing it stood there whole again for a frame
     def finish():
         widget.setGraphicsEffect(None)
-        if on_done is None:
-            widget.hide()
-        else:
+        widget.hide()
+        if on_done is not None:
             on_done()
 
     animation.finished.connect(finish)
@@ -268,11 +270,12 @@ ACCENT_SHADES = {
                "active": "rgba(224, 178, 60, 0.35)", "active_hover": "rgba(224, 178, 60, 0.50)",
                "banner": "#4f462b"},
 }
-# The switch is made in one go rather than eased from the one color to the
-# other. A fade has to rewrite every accent-colored stylesheet in the window on
-# every one of its frames, and Qt re-polishes each widget it is set on - a
-# tab that answers at once reads cleaner than a screenful of chrome crawling
-# between two hues, and costs one repaint instead of a dozen.
+# The switch is made in one go, and only looks eased: the window as it stood
+# is laid over it as a picture, which fades away to show the other color
+# under it. Easing the colors themselves would rewrite every accent-colored
+# stylesheet in the window on every frame, and Qt re-polishes each widget it
+# is set on - some 35 ms each time, where the picture costs one.
+ACCENT_FADE_MS = 220
 _accent = {"name": "blue", "shades": dict(ACCENT_SHADES["blue"])}
 
 def accent_name():
@@ -308,13 +311,28 @@ def paint_accent(root):
         return
     swap_shades(accent_widgets(root, ACCENT_SHADES["blue"]), ACCENT_SHADES["blue"], _accent["shades"])
 
-# the whole app's accent, switched to the one asked for
+# the whole app's accent, switched to the one asked for - fading from the
+# one to the other, while the window is up to be seen doing it
 def set_accent(name, root):
     if name == accent_name() or root is None:
         return
+    old = root.grab() if root.isVisible() else None
     start, end = _accent["shades"], ACCENT_SHADES[name]
     swap_shades(accent_widgets(root, start), start, end)
     _accent.update(name=name, shades=dict(end))
+    if old is not None:
+        fade_from_picture(root, old, ACCENT_FADE_MS)
+
+# A picture of how `root` looked laid over it, fading away to show it as it
+# is now: a change made at once, seen eased. It takes no clicks meanwhile.
+def fade_from_picture(root, picture, duration):
+    cover = QLabel(root)
+    cover.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+    cover.setPixmap(picture)
+    cover.setGeometry(root.rect())
+    cover.show()
+    cover.raise_()
+    fade_out(cover, duration, on_done=cover.deleteLater)
 
 # ================================================== SAVED APP STATE ================================================
 # Everything the app was showing when it was last closed, kept in a file beside
@@ -750,7 +768,7 @@ class HomeColumn(QWidget):
             box = shape.boundingRect()
             filling = QPainterPath()
             filling.addRect(QRectF(box.left(), box.top(), box.width(), box.height() * spread))
-            painter.fillPath(shape.intersected(filling), color)
+            fill_under_line(painter, shape.intersected(filling), shape, tab_line_of(shape.boundingRect()), color)
         painter.fillPath(tab_line_of(shape.boundingRect()), color)
         if self.hovered:
             painter.fillPath(shape, QColor(*TAB_HOVER_OVERLAY))
@@ -849,6 +867,18 @@ def _tab_path(kind, rect, make):
 
 def tab_shape_of(rect):
     return _tab_path("shape", rect, _tab_shape_at)
+
+# A tab's color filling it from its line down. The fill and the line meet on
+# the curve of its corners, where both have soft edges: laid one on the
+# other, the tab's own grey showed through between them, a thin arc at
+# each corner. The fill is drawn a little past its own edge to close that,
+# kept inside the tab and its line so it reaches nowhere else.
+def fill_under_line(painter, filled, shape, line, color):
+    painter.fillPath(filled, color)
+    painter.save()
+    painter.setClipPath(shape.united(line))
+    painter.strokePath(filled, QPen(QColor(color), 1.5))
+    painter.restore()
 
 def _tab_shape_at(rect):
     shape = QPainterPath()
@@ -1426,7 +1456,7 @@ class ReleaseTabBar(QTabBar):
                 rect = shape.boundingRect()
                 filling = QPainterPath()
                 filling.addRect(QRectF(rect.left(), rect.top(), rect.width(), rect.height() * spread))
-                grounds.fillPath(shape.intersected(filling), color)
+                fill_under_line(grounds, shape.intersected(filling), shape, self.tab_line(index), color)
             # ...and the line itself: straight across the top edge, the way
             # the accent used to mark whichever tab was open - the tab's own
             # rounded corners are all that shape it
@@ -3614,6 +3644,91 @@ class GridGraphicsView(QGraphicsView):
         self.settle.setInterval(MOVING_SETTLE_MS)
         self.settle.timeout.connect(self.stop_moving)
         self.refresh_draw_scale()
+
+        # A picture of the graph as it last stood still, painted instead of
+        # the graph itself while nothing about it has changed. Drawing a big
+        # graph takes a whole frame and more, and plenty asks for it that is
+        # not the graph's doing: a panel sliding open beside it, the rows of
+        # tabs unrolling over it, the window resized, a popup going away. Its
+        # content stays where it is through all of those, so the picture
+        # still holds for it - and where the view grew, only the strip it
+        # grew by is drawn. Anything about the graph itself changing - an
+        # item, the camera, the scene - and it is drawn afresh as ever, a new
+        # picture taken once it has been still a moment.
+        self.frame_cache = None        # (what it showed, the picture)
+        self.frame_revision = 0        # counts the scene's changes
+        self.frame_timer = QTimer(self)
+        self.frame_timer.setSingleShot(True)
+        self.frame_timer.setInterval(FRAME_CACHE_IDLE_MS)
+        self.frame_timer.timeout.connect(self.take_frame)
+        self.watch_scene(self.scene())
+
+    # ---- the picture of the graph (see __init__) ----
+
+    def watch_scene(self, scene):
+        if scene is not None:
+            scene.changed.connect(self.scene_changed)
+
+    def setScene(self, scene):
+        super().setScene(scene)
+        self.watch_scene(scene)
+        self.invalidate_frame()
+
+    def scene_changed(self, rects=None):
+        self.frame_revision += 1
+
+    # something it draws changed that its items do not know of: drawn afresh
+    def invalidate_frame(self):
+        self.frame_revision += 1
+        self.viewport().update()
+
+    # everything the picture depends on but the view's size
+    def frame_key(self):
+        t = self.transform()
+        return (self.scene(), self.frame_revision, t.m11(), t.m12(), t.m21(), t.m22(), t.dx(), t.dy(),
+                self.horizontalScrollBar().value(), self.verticalScrollBar().value(),
+                self.viewport().devicePixelRatioF(), self.moving, round(self.ring_opacity, 3),
+                self.pan_cursor.x(), self.pan_cursor.y())
+
+    # the whole view as it stands, drawn into a picture - through its own
+    # paint, so the picture is the very pixels it draws
+    def take_frame(self):
+        viewport = self.viewport()
+        if not viewport.isVisible() or viewport.width() < 1 or viewport.height() < 1:
+            return
+        key = self.frame_key()
+        self.taking_frame = True
+        try:
+            picture = viewport.grab()
+        finally:
+            self.taking_frame = False
+        self.frame_cache = (key, picture)
+
+    def paintEvent(self, event):
+        cache = self.frame_cache
+        if getattr(self, "taking_frame", False):
+            super().paintEvent(event)
+            return
+        if cache is None or cache[0] != self.frame_key():
+            self.frame_cache = None
+            super().paintEvent(event)
+            self.frame_timer.start()
+            return
+        picture = cache[1]
+        held = QRegion(QRect(QPoint(0, 0), picture.deviceIndependentSize().toSize()))
+        region = event.region()
+        painter = QPainter(self.viewport())
+        painter.setClipRegion(region.intersected(held))
+        painter.drawPixmap(0, 0, picture)
+        # the view grown past the picture: only the new strip is drawn
+        rest = region.subtracted(held)
+        if not rest.isEmpty():
+            painter.setClipRegion(rest)
+            painter.setRenderHints(self.renderHints())
+            bounds = rest.boundingRect()
+            self.render(painter, QRectF(bounds), bounds)
+            self.frame_timer.start()   # a picture of all of it once it stops growing
+        painter.end()
 
     # called by anything that moves the view or the graph: while they keep
     # coming the view stays in its cheap mode, and settles once they stop
@@ -9172,7 +9287,7 @@ def transition_scene(view, scene, crossfade=False, merges=None):
             final()
         ghosts.clear()
         view.setViewportUpdateMode(update_mode)
-        view.viewport().update()   # what the finals changed, drawn whole too
+        view.invalidate_frame()   # what the finals changed, drawn whole too
 
     def jump_to_end():
         animation.stop()   # deletes it: finished never fires for a stop
@@ -13007,7 +13122,7 @@ class HomePage(QWidget):
             area = area.united(QRectF(spot, item.rect().size()))
         radius = max(HOME_HUB_COG_RADIUS, min(area.width(), area.height()) * HOME_COG_SIZE / 2)
         self.view.cog = (area.center(), radius)
-        self.view.viewport().update()
+        self.view.invalidate_frame()
 
     def hub_spot(self, spots):
         standing = [(card, spot) for card, spot in spots.items() if card is not self.ghost] or list(spots.items())
