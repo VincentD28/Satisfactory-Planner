@@ -429,7 +429,7 @@ def load_options(saved):
 def saved_project(page):
     if not page.loaded():
         return {**page.saved, "name": page.project_name, "color": page.tab_color, "tab_page": page.tab_page,
-                "compact": page.compact}
+                "compact": page.compact, "hub_off": page.hub_off}
     cards =[{"item": entry["item"].full_name,
               "rate": entry["get_rate"](),
               "recipe": entry["get_recipe"]().full_name if entry["get_recipe"]() else None,
@@ -438,7 +438,7 @@ def saved_project(page):
     view = page.view
     steps = getattr(view, "build_steps", None)
     project = {"name": page.project_name, "color": page.tab_color, "tab_page": page.tab_page,
-               "compact": page.compact,
+               "compact": page.compact, "hub_off": page.hub_off,
                "outputs": cards, "built": bool(steps)}
     if steps:
         project["positions"] = node_positions(steps[-1]["nodes"])
@@ -662,6 +662,7 @@ TAB_NAME_MAX_CHARS = 24             # a name is kept to this many characters...
 TAB_NAME_PATTERN = r"[\w \-]*"      # ...of letters (accented too), digits, spaces, "-" and "_"
 RENAME_MIN_WIDTH = 200              # the rename box, however small the tab it hangs under
 PAGE_STRIP_HEIGHT = 22              # the row of page numbers over the tabs: well under a tab's height
+PAGE_STRIP_TITLE_HEIGHT = 32        # as tall again when it is the window's top row, its buttons on it
 PAGE_STRIP_BG = "#131313"           # a shade under the tab row's own, so the two read as two rows
 PAGE_STRIP_LINE = "#383838"         # and the line that parts them
 PAGE_CHIP_HEIGHT = 16
@@ -1549,7 +1550,9 @@ class PageStrip(QWidget):
         super().__init__()
         self.on_pick = on_pick
         self.on_wheel = on_wheel
-        self.setFixedHeight(PAGE_STRIP_HEIGHT)
+        # the window's top row whenever it is shown, so the window's own
+        # buttons stand on it (see MainWindow.place_window_buttons)
+        self.setFixedHeight(PAGE_STRIP_TITLE_HEIGHT if CUSTOM_TITLE_BAR else PAGE_STRIP_HEIGHT)
         self.setAttribute(Qt.WA_StyledBackground, True)
         # its own darker ground and a line along its foot: a strip of its own
         # over the tabs, not the top of the tab row
@@ -2503,10 +2506,15 @@ def make_project_tabs():
     # the band between the row and the page, in the color of the tab that is
     # open and fading into the page's own grey where the two meet - so the
     # color reads as belonging to that project rather than as a stripe
+    # the tab row is the window's top row only with nothing over it: neither
+    # the page numbers nor the floors of the pages before it
+    def bar_is_top():
+        return wrap_rows.isHidden() and page_strip.isHidden()
+
     # the room the window's own buttons keep at the right end of the top row
     # of tabs (see WindowButtons): this row's, while it is that row
     def buttons_room():
-        return WINDOW_BUTTONS_WIDTH if CUSTOM_TITLE_BAR and wrap_rows.isHidden() else 0
+        return WINDOW_BUTTONS_WIDTH if CUSTOM_TITLE_BAR and bar_is_top() else 0
 
     page_line = PageBand(tabs)
     page_line.setAttribute(Qt.WA_TransparentForMouseEvents, True)
@@ -2562,7 +2570,7 @@ def make_project_tabs():
         # of the window's own buttons past them while this is the top row: a
         # row too long for its own width scrolls (see wheelEvent) rather than
         # running on under them
-        bar.setMaximumWidth(max(tabs.width() - (reserved_room() if wrap_rows.isHidden() else PAGE_BUTTONS_ROOM), 1))
+        bar.setMaximumWidth(max(tabs.width() - (reserved_room() if bar_is_top() else PAGE_BUTTONS_ROOM), 1))
         # the rows of the pages after the open one, when every row is shown,
         # stand between the tab row and the band - in page order
         below = rows_below_height[0]
@@ -2672,10 +2680,10 @@ def make_project_tabs():
     # each takes
     # The top row is the window's: it keeps the reserved stretch, and so has
     # less room than the rows under it. Showing every row, that is the first
-    # one; showing one at a time, it is whichever is shown - so every one.
+    # one; showing one at a time, the page numbers are, so no row of tabs is.
     def cut_pages(entries, width_of):
         def room():
-            return row_room(top=not panel_options["tabs_wrap"] or not shown)
+            return row_room(top=panel_options["tabs_wrap"] and not shown)
 
         shown = []
         for m in range(max([pages_state["manual"]] + [number + 1 for _, number in entries])):
@@ -2999,7 +3007,7 @@ def make_project_tabs():
         rows_button.setToolTip("Show one page at a time" if rows else "Show every page's row")
         x = tabs.width() - buttons_room() - PAGE_BUTTON_GAP - 3 * PAGE_BUTTON_SIZE - 2 * 2
         y = bar.y() + (PROJECT_TABS_HEIGHT - PAGE_BUTTON_SIZE) // 2   # halfway down the row
-        if CUSTOM_TITLE_BAR and wrap_rows.isHidden() and not page_strip.isVisible():
+        if CUSTOM_TITLE_BAR and bar_is_top():
             # the window's top row, right under its top gap: halfway down the
             # two together, level with the window's own buttons beside them
             y -= WINDOW_TOP_GAP // 2
@@ -5959,14 +5967,15 @@ def format_power(megawatts):
         return f"{trimmed(megawatts, 2)} MW"
     return f"{trimmed(megawatts, 3)} MW" if megawatts else "0 MW"
 
-# an ore's extraction, run by a miner
+# a resource's extraction - an ore under a miner, or water, oil or a well's
+# fluid under its extractor: every machine that pulls from the ground has a cycle
 def is_mined(node):
-    return isinstance(node, Recipe_Node) and node.machine.full_name.startswith("Build_MinerMk")
+    return isinstance(node, Recipe_Node) and getattr(node.machine, "extract_cycle_time", None) is not None
 
 # (name, caption): the name is all the box itself holds, the caption rests under it
 def node_display_lines(node, values):
     if is_mined(node):
-        # a miner's count says little - it hangs on the purity of the ore
+        # an extractor's count says little - it hangs on the purity of the
         # nodes it lands on - so what they have to give is said instead
         return node.recipe_name, f"{values['needed_rate']:.2f} {rate_unit(node.item)}"
     if isinstance(node, Recipe_Node):
@@ -12341,7 +12350,7 @@ HOME_GRAB_SHADOW = 60                      # and throws a shadow, this soft
 HOME_FADE_MS = 260                         # a new project's card coming in
 HOME_PAGE_LABEL_SIZE = 40                  # "Page 2", left of its row
 HOME_PAGE_LABEL_WIDTH = GRID_SQUARE * 2
-HOME_CARDS_PER_LINE = 5                    # a page longer than this goes on over the lines under it
+HOME_CARDS_PER_LINE = 4                    # a page longer than this goes on over the lines under it
 HOME_HUB_GAP = GRID_SQUARE * 3             # from the power node down to the first row
 HOME_HUB_SPOT = (-POWER_NODE_WIDTH / 2, -HOME_HUB_GAP - POWER_NODE_HEIGHT)   # with no card to stand over
 HOME_CARD_HEADER = 104                     # the band in the project's own color, its name on it
@@ -12375,6 +12384,7 @@ HOME_HUB_COG_RADIUS = GRID_SQUARE * 6      # ...in the hub's middle, never small
 HOME_LABEL_SIZE = 12
 HOME_MENU_BUTTON = 64                      # the "..." in a card's band that opens its menu
 HOME_MENU_BUTTON_ALPHA = 46                # its soft ground, under the mouse
+HOME_CARD_OFF_OPACITY = 0.4                # a project switched off on the hub: faded out
 HOME_VERSION_BG = QColor(37, 37, 37, 217)    # the game version, in the hub's corner: 85% opaque
 HOME_VERSION_PAD = (10, 5)                   # its words from its edges, across and down
 
@@ -12509,10 +12519,35 @@ class CardMenuButton(QGraphicsItem):
             ground.setAlpha(HOME_MENU_BUTTON_ALPHA)
             painter.setBrush(ground)
             painter.drawRoundedRect(self.box, self.box.width() / 4, self.box.width() / 4)
+        self.paint_mark(painter)
+
+    def paint_mark(self, painter):
         painter.setBrush(self.color)
         dot = self.box.width() / 14
         for step in (-1, 0, 1):
             painter.drawEllipse(self.box.center() + QPointF(step * dot * 3.2, 0), dot, dot)
+
+
+# The power switch beside the "...": a project switched off stays on the hub,
+# faded, but its power is out of the hub's count and its line comes down. It
+# keeps its own strength whatever the card it sits on is faded to, so it can
+# still be read and switched back on.
+class CardSwitchButton(CardMenuButton):
+    def __init__(self, color, on_click, off, parent=None):
+        super().__init__(color, on_click, parent)
+        self.setFlag(QGraphicsItem.ItemIgnoresParentOpacity)
+        self.setToolTip("Switch this project back on, on the hub" if off
+                        else "Switch this project off on the hub: its power is left out")
+
+    def paint_mark(self, painter):
+        size = self.box.width()
+        painter.setPen(QPen(self.color, size / 12, Qt.SolidLine, Qt.RoundCap))
+        painter.setBrush(Qt.NoBrush)
+        ring = QRectF(0, 0, size * 0.42, size * 0.42)
+        ring.moveCenter(self.box.center() + QPointF(0, size * 0.03))
+        # the ring open at the top, and the stroke down into that gap
+        painter.drawArc(ring, 125 * 16, 290 * 16)
+        painter.drawLine(QPointF(ring.center().x(), ring.top() - size * 0.06), ring.center())
 
 
 # What every card on the hub shares: a box of whole grid squares that lifts
@@ -12539,11 +12574,26 @@ class HomeCardItem(QGraphicsRectItem):
         # or the hub panned, it is not worked out again - a card is mostly text
         self.setCacheMode(QGraphicsItem.DeviceCoordinateCache)
 
+    # Where the card's shadow falls, drawn again. The hub's view listens to
+    # the scene's changes (see GridGraphicsView), and a scene listened to
+    # repaints only an item's own bounds where it moves - not the shadow
+    # around them, which was left on the grid wherever the card had been, and
+    # where it was set down. Its blur is laid out on screen, so it reaches
+    # further over the map the further out the hub is zoomed.
+    def clear_shadow(self):
+        scene = self.scene()
+        if scene is None or self.graphicsEffect() is None:
+            return
+        zoom = min((view.transform().m11() for view in scene.views()), default=1.0) or 1.0
+        reach = 2 * HOME_GRAB_SHADOW * max(1.0, 1.0 / zoom)
+        scene.update(self.sceneBoundingRect().adjusted(-reach, -reach, reach, reach))
+
     # picked up: a little bigger, over every other card, with a shadow under
     # it - and set down again, back to its size
     def set_grabbed(self, grabbed):
         self.setZValue(5 if grabbed else 1)
         self.setCursor(Qt.ClosedHandCursor if grabbed else Qt.PointingHandCursor)
+        self.clear_shadow()
         if grabbed:
             shadow = QGraphicsDropShadowEffect()
             shadow.setBlurRadius(HOME_GRAB_SHADOW)
@@ -12624,6 +12674,7 @@ class HomeCardItem(QGraphicsRectItem):
             self.on_drag(self, event.scenePos(), "start")
         middle = self.transformOriginPoint()
         held = middle + (self.grab_at - middle) * self.scale()
+        self.clear_shadow()
         self.setPos(event.scenePos() - held)
         self.on_drag(self, event.scenePos(), "move")
 
@@ -12643,7 +12694,7 @@ class HomeCardItem(QGraphicsRectItem):
 # One project on the hub. Its band and outline are the project's tab color,
 # so a project reads as the same thing on its tab and on the hub.
 class ProjectCardItem(HomeCardItem):
-    def __init__(self, page, summary, on_click, on_menu, last=False):
+    def __init__(self, page, summary, on_click, on_menu, on_switch, last=False):
         # its outputs' pictures along the middle, what each is asked for
         # under it: as wide as they need, up to HOME_CARD_PICTURES of them
         outputs = summary["outputs"]
@@ -12664,6 +12715,11 @@ class ProjectCardItem(HomeCardItem):
         self.menu_button = CardMenuButton(self.name_color, self.menu_from_button, self)
         self.menu_button.setPos(self.rect().width() - HOME_CARD_PAD / 2 - HOME_MENU_BUTTON,
                                 (HOME_CARD_HEADER - HOME_MENU_BUTTON) / 2)
+        self.off = page.hub_off
+        self.switch_button = CardSwitchButton(self.name_color, on_switch, self.off, self)
+        self.switch_button.setPos(self.menu_button.pos() - QPointF(HOME_MENU_BUTTON, 0))
+        if self.off:
+            self.setOpacity(HOME_CARD_OFF_OPACITY)
 
         self.more = more
         self.rates = []
@@ -12682,6 +12738,8 @@ class ProjectCardItem(HomeCardItem):
 
         lines = [f"<b>{html.escape(self.name)}</b>"]
         lines += [f"{html.escape(item.display_name)}: {rate_text(item, rate)}" for item, rate in outputs]
+        if self.off:
+            lines.append("<i>Switched off: left out of the hub's power</i>")
         lines.append("<i>Click to open - right click for more</i>")
         self.setToolTip("<br>".join(lines))
 
@@ -12724,7 +12782,7 @@ class ProjectCardItem(HomeCardItem):
 
         inner = self.rect().width() - 2 * HOME_CARD_PAD
         paint_card_text(painter, scale,
-                        QRectF(HOME_CARD_PAD, 0, inner - HOME_MENU_BUTTON, HOME_CARD_HEADER),
+                        QRectF(HOME_CARD_PAD, 0, inner - 2 * HOME_MENU_BUTTON, HOME_CARD_HEADER),
                         self.name, HOME_CARD_NAME_SIZE, self.name_color, bold=True)
 
         summary = self.summary
@@ -13277,12 +13335,15 @@ class HomePage(QWidget):
             for page in pages:
                 summary = project_summary(page)
                 # a project's own generators run its own machines first: what
-                # reaches the grid is its net, as spare power or as a shortfall
-                net = summary["made"] - summary["drawn"]
-                made += max(net, 0.0)
-                drawn += max(-net, 0.0)
+                # reaches the grid is its net, as spare power or as a shortfall.
+                # One switched off adds nothing to it.
+                if not page.hub_off:
+                    net = summary["made"] - summary["drawn"]
+                    made += max(net, 0.0)
+                    drawn += max(-net, 0.0)
                 card = ProjectCardItem(page, summary, lambda page=page: self.open_project(page),
-                                       lambda at, page=page: self.project_menu(page, at), last=page is last)
+                                       lambda at, page=page: self.project_menu(page, at),
+                                       lambda page=page: self.switch_project(page), last=page is last)
                 card.on_drag = self.card_drag
                 scene.addItem(card)
                 self.cards[page] = card
@@ -13331,7 +13392,7 @@ class HomePage(QWidget):
         sides = set()
         for card in self.cards.values():
             summary = card.summary
-            if summary["made"] or summary["drawn"]:
+            if (summary["made"] or summary["drawn"]) and not card.off:
                 card.feeding = summary["made"] > summary["drawn"]
                 sides.add(card.feeding)
         self.hub.paired_ports = len(sides) > 1
@@ -13414,6 +13475,12 @@ class HomePage(QWidget):
         for line in self.power_lines:
             line.set_live(self.lines_live)
 
+    # a project in or out of the hub's power, its card faded while it is out
+    def switch_project(self, page):
+        page.hub_off = not page.hub_off
+        schedule_save()
+        self.refresh()
+
     def open_project(self, page):
         if self.tabs is not None and self.tabs.indexOf(page) != -1:
             self.tabs.setCurrentIndex(self.tabs.indexOf(page))
@@ -13439,6 +13506,7 @@ class HomePage(QWidget):
         menu.addSeparator()
         menu.addAction("Rename...", lambda: self.edit_project(page))
         menu.addAction("Change color...", lambda: self.edit_project(page, colors=True))
+        menu.addAction("Switch on" if page.hub_off else "Switch off", lambda: self.switch_project(page))
         menu.addSeparator()
         menu.addAction("Delete project", lambda: self.tabs.remove_project_tab(page))
         menu.exec(at)
@@ -14064,6 +14132,7 @@ class ProjectPage(QWidget):
         # the color of its tab, and of the band under the row while it is open
         self.tab_color = (saved or {}).get("color") or TAB_DEFAULT_COLOR
         self.tab_page = (saved or {}).get("tab_page", 0)   # which page of the tab row it is on
+        self.hub_off = (saved or {}).get("hub_off", False)   # switched off on the hub: its power left out
         self.home_cache = None   # its tree as the hub last worked it out, while it is not loaded
         # compact or detailed boxes: this project's own, whatever the others
         # are at. A new one starts detailed; one from a save made before
@@ -14281,10 +14350,11 @@ class ProjectPage(QWidget):
 
 
 # ==================================================== TITLE BAR ====================================================
-# On Windows the app has no title bar of its own over it: the top row of
-# tabs is the window's top, its empty ground what the window is dragged by,
-# and at its right end stand the window's own three buttons - minimize, full
-# screen and close. The window keeps its native frame all the same - its
+# On Windows the app has no title bar of its own over it: the top row - the
+# page numbers while one page is shown at a time, else the top row of tabs -
+# is the window's top, its empty ground what the window is dragged by, and at
+# its right end stand the window's own three buttons - minimize, full screen
+# and close. The window keeps its native frame all the same - its
 # shadow, rounded corners, resizing from every edge, and dragging with all
 # that comes with it: snapping to an edge, a double click to maximize, the
 # window menu on a right click. Windows is only told the frame takes no room
@@ -14427,6 +14497,7 @@ class WindowButtons(QWidget):
         for button in self.buttons:
             row.addWidget(button)
         self.on_floor = False   # standing on a floor of the rows: its line runs on under them
+        self.on_strip = False   # standing on the page numbers: on their darker ground and line
 
     def refresh(self):
         for button in self.buttons:
@@ -14442,7 +14513,7 @@ class WindowButtons(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(TAB_BAR_BG))
+        painter.fillRect(self.rect(), QColor(PAGE_STRIP_BG if self.on_strip else TAB_BAR_BG))
         painter.fillRect(0, 0, 1, self.height(), QColor(WINDOW_BUTTONS_WALL))
         # a thin line between two buttons, fading out towards both its ends
         span = self.height() * WINDOW_BUTTONS_SEPARATOR_SPAN
@@ -14458,6 +14529,9 @@ class WindowButtons(QWidget):
         if self.on_floor:
             painter.fillRect(QRectF(0, self.height() - 1, self.width() - TAB_FLOOR_INSET, 1),
                              QColor(*TAB_FLOOR_LINE))
+        # and the page numbers' line along their foot
+        elif self.on_strip:
+            painter.fillRect(0, self.height() - 1, self.width(), 1, QColor(PAGE_STRIP_LINE))
         painter.end()
 
 
@@ -14634,28 +14708,33 @@ class MainWindow(QMainWindow):
 
     # ---- the window's top row standing in for a title bar (see WindowButtons) ----
 
-    # at the right end of the top row of tabs: the first floor while the rows
-    # of every page are shown over the open one, else the tab row itself
+    # at the right end of the window's top row: the page numbers while one
+    # page is shown at a time, the first floor while the rows of every page
+    # are shown over the open one, else the tab row itself
     def place_window_buttons(self):
         buttons = getattr(self, "window_buttons", None)
         if buttons is None:
             return
         tabs = self.project_tabs
-        on_floor = not tabs.wrap_rows.isHidden()
-        top_row = tabs.wrap_rows if on_floor else tabs.tabBar()
-        if buttons.on_floor != on_floor:
-            buttons.on_floor = on_floor
+        on_strip = not tabs.page_strip.isHidden()
+        on_floor = not on_strip and not tabs.wrap_rows.isHidden()
+        top_row = tabs.page_strip if on_strip else tabs.wrap_rows if on_floor else tabs.tabBar()
+        if (buttons.on_strip, buttons.on_floor) != (on_strip, on_floor):
+            buttons.on_strip, buttons.on_floor = on_strip, on_floor
             buttons.update()
-        # the window's top gap right over the top row - no page numbers
-        # between - is theirs too: they run up to the window's edge
+        # the window's top gap right over the top row is theirs too: they run
+        # up to the window's edge
         row_top = top_row.mapTo(self, QPoint(0, 0)).y()
-        reach = WINDOW_TOP_GAP if self.top_gap is not None and not tabs.page_strip.isVisible() else 0
-        buttons.set_height(PROJECT_TABS_HEIGHT + reach)
+        row_height = PAGE_STRIP_TITLE_HEIGHT if on_strip else PROJECT_TABS_HEIGHT
+        reach = WINDOW_TOP_GAP if self.top_gap is not None else 0
+        buttons.set_height(row_height + reach)
         buttons.move(self.width() - buttons.width(), row_top - reach)
         buttons.raise_()
-        # the line where the top row's reserved stretch begins, as tall
+        # the line where the top row of tabs' reserved stretch begins, as
+        # tall - none on the page numbers, which keep no tabs to part it from
         edge = self.reserved_edge
-        edge.setGeometry(self.width() - reserved_room(), row_top - reach, 1, PROJECT_TABS_HEIGHT + reach)
+        edge.setVisible(not on_strip)
+        edge.setGeometry(self.width() - reserved_room(), row_top - reach, 1, row_height + reach)
         edge.raise_()
         if self.top_gap is not None:
             self.top_gap.update()   # its color follows what is under it

@@ -2,9 +2,18 @@
 # Date        : 12-08-2026
 
 # todo : 
+#      : being able to edit the number and overclock of the machines of a node in the graph
+#      : when changing a recipe in the graph, being able to add the recipe, not only change it
 #      : 
 #      : 
+#      : 
+#      : 
+#      : 
+#      : map to connect input for project to the the nodes they are extraction (keeping track of the usage of each nodes)
 
+#      : x water, oil and resource well extractors say their flow under the node instead of their count, like the miners
+#      : x hub cards switch off (power button in the band, or the card menu): faded, power line down, left out of the hub's total (remembered)
+#      : x a dragged hub card's shadow no longer left behind on the grid
 #      : x the window's own title bar (Windows): taller, in the app's grey, gear + name, its own min/max/close (close goes red), native dragging/snapping/resizing kept
 #      : x node titles never cut a word: the name shrinks to the biggest size its longest word fits at, to the pixel
 #      : x hub and tabs live both ways: a card dragged on the hub moves the tabs as it goes, a tab dragged moves the cards
