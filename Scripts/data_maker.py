@@ -352,8 +352,11 @@ class Recipe:
     # the quantum encoder swing between the two while they craft, and their
     # machines carry no draw of their own at all. Both 0 for every other
     # recipe, which draws what its machine draws.
+    # power_boost: what a generator adds to its whole grid's power, as a share
+    # of it - the Alien Power Augmenter's tenth, or more on its matrices - on
+    # top of the power it makes itself. 0 for everything else.
     def __init__(self, full_name, display_name, products, ingredients, duration, machine,
-                 is_alternate, power_min=0.0, power_max=0.0):
+                 is_alternate, power_min=0.0, power_max=0.0, power_boost=0.0):
         self.full_name = full_name
         self.display_name = display_name
         self.products = products
@@ -363,6 +366,7 @@ class Recipe:
         self.is_alternate = is_alternate
         self.power_min = power_min
         self.power_max = power_max
+        self.power_boost = power_boost
 
     # what one machine running it draws on average, or 0 when it just draws
     # whatever its machine does
@@ -381,6 +385,33 @@ class Recipe:
             "is_alternate": self.is_alternate,
             "power_min": self.power_min,
             "power_max": self.power_max,
+            "power_boost": self.power_boost,
+        }
+
+# A building that only draws power: nothing goes in, nothing comes out. The
+# stations and platforms trains and trucks stop at, a drone port, the lights,
+# the sink... (`category` "consumer"), and the pumps that push a fluid up a
+# pipe (`category` "pump"). `power` is what one draws - the middle of its range,
+# for an electric locomotive, whose draw swings between power_min and power_max.
+class PowerBuilding:
+    def __init__(self, full_name, display_name, power, category, power_min=0.0, power_max=0.0, picture=""):
+        self.full_name = full_name
+        self.display_name = display_name
+        self.power = power
+        self.category = category
+        self.power_min = power_min
+        self.power_max = power_max
+        self.picture = picture
+
+    def to_dict(self):
+        return {
+            "full_name": self.full_name,
+            "display_name": self.display_name,
+            "power": self.power,
+            "category": self.category,
+            "power_min": self.power_min,
+            "power_max": self.power_max,
+            "picture": self.picture,
         }
 
 class Machine:
@@ -448,6 +479,30 @@ def parse_machine_list(raw):
     return RECIPE_MACHINE_FORM.findall(raw)
 
 
+# The buildings that only draw power, and what they are (see PowerBuilding):
+# by the name the game knows them as - a vehicle by its descriptor
+POWER_BUILDINGS = (
+    ("Build_TrainStation_C", "consumer"),
+    ("Build_TrainDockingStation_C", "consumer"),
+    ("Build_TrainDockingStationLiquid_C", "consumer"),
+    ("Desc_Locomotive_C", "consumer"),
+    ("Build_TruckStation_C", "consumer"),
+    ("Build_FluidTruckStation_C", "consumer"),
+    ("Build_DroneStation_C", "consumer"),
+    ("Build_PipeHyperStart_C", "consumer"),
+    ("Build_Elevator_C", "consumer"),
+    ("Build_StreetLight_C", "consumer"),
+    ("Build_CeilingLight_C", "consumer"),
+    ("Build_FloodlightPole_C", "consumer"),
+    ("Build_FloodlightWall_C", "consumer"),
+    ("Build_ResourceSink_C", "consumer"),
+    ("Build_RadarTower_C", "consumer"),
+    ("Build_Portal_C", "consumer"),
+    ("Build_PortalSatellite_C", "consumer"),
+    ("Build_PipelinePump_C", "pump"),
+    ("Build_PipelinePumpMk2_C", "pump"),
+)
+
 # what an unpackaging recipe hands back on the side of what was packaged
 PACKAGING_CONTAINERS = ("Desc_FluidCanister_C", "Desc_GasTank_C")
 
@@ -456,6 +511,7 @@ def clean_data(source=None):
     All_Items = {}
     All_Recipes = {}
     All_Machines = {}
+    All_Power_Buildings = {}
     All_data_entries = {}
 
     # === ORIGINAL_DATA --> All_Items and All_Recipes ===
@@ -531,6 +587,7 @@ def clean_data(source=None):
             "FGBuildableGeneratorFuel",             # 3  biomass burner, coal and fuel generators
             "FGBuildableGeneratorNuclear",          # 1  nuclear power plant
             "FGBuildableGeneratorGeoThermal",       # 1  geothermal generator
+            "FGBuildablePowerBooster",              # 1  alien power augmenter
         )
 
         for b in MACHINE_BLOCKS:
@@ -551,8 +608,12 @@ def clean_data(source=None):
                                    else 1),
                     extract_cycle_time = float(m["mExtractCycleTime"]) if "mExtractCycleTime" in m else None,
                     items_per_cycle = int(m["mItemsPerCycle"]) if "mItemsPerCycle" in m else None,
-                    allowed_resources = parse_resource_list(m.get("mAllowedResources", "")),  
+                    allowed_resources = parse_resource_list(m.get("mAllowedResources", "")),
                 )
+                # what it costs to build is an item like any other, even one
+                # no recipe makes or takes - the augmenter's somersloop
+                for entry in All_Machines[m["ClassName"]].ingredients:
+                    get_item(entry["item"])
         print(f"All_Machines: {len(All_Machines)} machines instanciated.")
         
         # -- Extraction recipes instanciation --
@@ -613,7 +674,9 @@ def clean_data(source=None):
         power_recipe_count = 0
         for machine_name, m in All_Machines.items():
             entry = All_data_entries[machine_name]
-            production = float(entry.get("mPowerProduction", 0) or 0)
+            # the alien power augmenter says its own power as a base, the
+            # boost it gives its grid being on top of that (see below)
+            production = float(entry.get("mPowerProduction", 0) or entry.get("mBasePowerProduction", 0) or 0)
             # the geothermal generator has no fixed output: it swings over a
             # range like the variable power machines, so it is taken at its
             # average, and it burns nothing at all
@@ -622,6 +685,39 @@ def clean_data(source=None):
                 high = low + float(entry.get("mVariablePowerProductionFactor", 0) or 0)
                 production = (low + high) / 2
             if not production:
+                continue
+
+            # The alien power augmenter burns nothing to make its power, and
+            # adds a share of its whole grid's power on top (mBaseBoostPercentage)
+            # - more for as long as an Alien Power Matrix lasts in it: one
+            # every mBoostDuration seconds, for mBoostPercentage more.
+            base_boost = float(entry.get("mBaseBoostPercentage", 0) or 0)
+            if base_boost:
+                # written ("/Game/.../Desc_AlienPowerFuel.Desc_AlienPowerFuel_C"), no quote after it
+                fuels = re.findall(r"\.(\w+_C)\b", entry.get("mDefaultFuelClasses", "") or "")
+                for fuel_class in [""] + list(dict.fromkeys(fuels)):
+                    fuel_entry = All_data_entries.get(fuel_class, {})
+                    lasts = float(fuel_entry.get("mBoostDuration", 0) or 0)
+                    if fuel_class and not lasts:
+                        continue
+                    ingredients = ([{"item": fuel_class, "amount": GENERATION_MINUTE / lasts}]
+                                   if fuel_class else [])
+                    recipe_name = f"Generate_{fuel_class or machine_name}_{machine_name}"
+                    All_Recipes[recipe_name] = Recipe(
+                        full_name=recipe_name,
+                        display_name=(f"Burn {fuel_entry['mDisplayName']}" if fuel_class
+                                      else entry["mDisplayName"]),
+                        products=[{"item": POWER_ITEM, "amount": production}],
+                        ingredients=ingredients,
+                        duration=GENERATION_MINUTE,
+                        machine=[machine_name],
+                        is_alternate=False,
+                        power_boost=round(base_boost + float(fuel_entry.get("mBoostPercentage", 0) or 0), 6),
+                    )
+                    power_recipe_count += 1
+                    get_item(POWER_ITEM).recipes.append(recipe_name)
+                    for ingredient in ingredients:
+                        get_item(ingredient["item"])
                 continue
 
             water_ratio = float(entry.get("mSupplementalToPowerRatio", 0) or 0)
@@ -669,6 +765,35 @@ def clean_data(source=None):
                     get_item(ingredient["item"])
 
         print(f"All_Recipes addition: {power_recipe_count} power generation recipes instanciated.")
+
+        # -- Buildings that only draw power --
+        #
+        # In the order they are offered: rail first, then the stations other
+        # vehicles stop at, getting about, lights, and what is left. A vehicle
+        # is read off its descriptor, a building off its buildable.
+        for name, category in POWER_BUILDINGS:
+            entry = All_data_entries.get(name)
+            if entry is None:
+                continue
+            raw = str(entry.get("mPowerConsumption", "") or "")
+            span = re.search(r"Min=([\d.]+),Max=([\d.]+)", raw)
+            if span:
+                low, high = float(span.group(1)), float(span.group(2))
+                power = (low + high) / 2
+            else:
+                low = high = 0.0
+                try:
+                    power = float(raw)
+                except ValueError:
+                    continue
+            if power <= 0:
+                continue
+            descriptor = entry if name.startswith("Desc_") else All_data_entries.get(
+                "Desc_" + name.removeprefix("Build_"), {})
+            All_Power_Buildings[name] = PowerBuilding(
+                full_name=name, display_name=entry["mDisplayName"], power=power, category=category,
+                power_min=low, power_max=high, picture=parse_icon(descriptor))
+        print(f"All_Power_Buildings: {len(All_Power_Buildings)} power-only buildings instanciated.")
 
         # -- Items instanciation --
         # Already done in previous section
@@ -751,6 +876,7 @@ def clean_data(source=None):
         "items": {name: item.to_dict() for name, item in All_Items.items()},
         "recipes": {name: recipe.to_dict() for name, recipe in All_Recipes.items()},
         "machines": {name: machine.to_dict() for name, machine in All_Machines.items()},
+        "power_buildings": {name: building.to_dict() for name, building in All_Power_Buildings.items()},
     }
 
     with open(kept_file("cleaned_data.json"), "w", encoding="utf-8") as f:

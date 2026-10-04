@@ -3,14 +3,17 @@
 
 # todo : 
 #      : being able to edit the number and overclock of the machines of a node in the graph
-#      : when changing a recipe in the graph, being able to add the recipe, not only change it
-#      : 
-#      : 
-#      : 
-#      : 
-#      : 
+#      : being able to specify the level/number/overclock/purity/separation of an extraction node
+#      :
+#      :
+#      :
 #      : map to connect input for project to the the nodes they are extraction (keeping track of the usage of each nodes)
 
+#      : x Alien Power Augmenter as a generator (plain, or burning Alien Power Matrix): 500 MW each + 10% / 30% of the whole hub grid's power, the grid power going in shown on its card, its node's panel and the power node
+#      : x pipeline pumps on fluid lines: hover a pipe and click once to place one (the pipe level's mark), click it for its settings (mark, number, remove), drag it along; a power line to the power node each
+#      : x output panel: Output / Power, Power holding Generator / Consumer. A consumer (stations, platforms, locomotive, drone port, hypertube entrance, elevator, lights, sink, radar tower, portals) is a card counted in buildings and a node on the map drawing on the power node
+
+#      : x recipe dropdowns (graph and output cards): Change or Add the recipe picked; an added one takes the flow typed in a box (0 to all of the others', the others giving it up), an output's recipes share one card
 #      : x water, oil and resource well extractors say their flow under the node instead of their count, like the miners
 #      : x hub cards switch off (power button in the band, or the card menu): faded, power line down, left out of the hub's total (remembered)
 #      : x a dragged hub card's shadow no longer left behind on the grid
@@ -111,7 +114,7 @@ import math
 import os
 from collections import deque
 from enum import Enum
-from data_maker import Item, Recipe, Machine, data_file
+from data_maker import Item, Recipe, Machine, PowerBuilding, data_file
 
 # === CLEANED_DATA --> All_... ===
 
@@ -127,6 +130,9 @@ SOURCE_PATH_CLEANED_DATA = data_file("cleaned_data.json")
 All_Recipes = {}
 All_Items = {}
 All_Machines = {}
+# ...and every building that only draws power (see data_maker.PowerBuilding):
+# the consumers an output panel can ask for, and the pumps a pipe can carry
+All_Power_Buildings = {}
 
 MINER_NAME = "Build_MinerMk{}_C"
 MINER_MARK = 1
@@ -143,9 +149,12 @@ def load_data():
     All_Recipes.clear()
     All_Items.clear()
     All_Machines.clear()
+    All_Power_Buildings.clear()
     All_Recipes.update({name: Recipe(**d) for name, d in raw["recipes"].items()})
     All_Items.update({name: Item(**d) for name, d in raw["items"].items()})
     All_Machines.update({name: Machine(**d) for name, d in raw["machines"].items()})
+    # none in data made before they were read in: no consumer to offer, no pump
+    All_Power_Buildings.update({name: PowerBuilding(**d) for name, d in raw.get("power_buildings", {}).items()})
 
 
     # swap each name for the Item it points at
@@ -262,6 +271,36 @@ def power_range_for(node, machine_nb):
 def is_power_node(node):
     return isinstance(node, Power_Node)
 
+# the buildings an output panel can ask for that only draw power, in the
+# order the data offers them - and the pumps, the cheapest first
+def consumer_buildings():
+    return [building for building in All_Power_Buildings.values() if building.category == "consumer"]
+
+def pump_buildings():
+    return sorted((building for building in All_Power_Buildings.values() if building.category == "pump"),
+                  key=lambda building: building.power)
+
+# A share of the whole grid's power a generator adds on top of its own - the
+# Alien Power Augmenter's. 0 for any other.
+def power_boost_of(node):
+    return getattr(getattr(node, "recipe", None), "power_boost", 0.0) or 0.0
+
+# What draws power without being part of the tree: the buildings the output
+# panel asks for that only draw it, and the pumps along its pipes - each
+# {"name", "count", "power"} (power for all `count` of them together). The
+# power node takes them in, and is made for them when nothing else draws or
+# makes power; with none left, it goes as it would have.
+def set_extra_draw(nodes, extra):
+    extra = [entry for entry in (extra or []) if entry.get("power", 0) > 0]
+    power = next((node for node in nodes if is_power_node(node)), None)
+    if power is None:
+        if not extra:
+            return
+        power = Power_Node()
+        nodes.append(power)
+    power.extra = extra
+    refresh_power(nodes)
+
 # a recipe that makes power: a burner, a nuclear plant, a geothermal generator
 def is_generator(node):
     return isinstance(node, Recipe_Node) and node.entry_for(node.products, POWER_ITEM) is not None
@@ -274,11 +313,14 @@ def is_generator(node):
 # build.
 def refresh_power(nodes):
     drawing = [node for node in nodes
-               if isinstance(node, Recipe_Node) and node.entry_for(node.ingredients, POWER_ITEM) is not None]
+               if isinstance(node, (Recipe_Node, Consumer_Node))
+               and node.entry_for(node.ingredients, POWER_ITEM) is not None]
     making = [node for node in nodes if is_generator(node)]
     power = next((node for node in nodes if is_power_node(node)), None)
 
-    if not drawing and not making:
+    # the power node stays for what draws on it from outside the tree too
+    # (see set_extra_draw), with nothing in the tree drawing or making any
+    if not drawing and not making and not (power is not None and power.extra):
         if power is not None:
             cut_out(nodes, [power])
         return
@@ -314,6 +356,9 @@ def refresh_power(nodes):
         entry = node.entry_for(node.products, POWER_ITEM)
         entry["to"] = {power: entry["rate"]}
         made[node] = entry["rate"]
+    # what the augmenters among them add to the whole grid, as a share of it:
+    # each building its own share (see power_boost_of)
+    power.boost_fraction = sum(power_boost_of(node) * node.machine_nb for node in making)
     power.recalculate()
 
 # === Node Logic ===
@@ -537,6 +582,92 @@ def take_surplus(node, item, rate, nodes):
         made.setdefault("surplus", set()).add(node)
         taken += take
     return taken
+
+# A recipe pick, as the choices hold it: one Recipe (or None, the item's
+# default), or the item shared between several - [(Recipe, share)], the
+# shares adding up to one. Read as the list either way.
+def split_of(pick):
+    if not isinstance(pick, (list, tuple)):
+        return [(pick, 1.0)]
+    total = sum(share for _, share in pick)
+    if total <= SOLVE_TOLERANCE:
+        return [(pick[0][0], 1.0)] if pick else [(None, 1.0)]
+    return [(recipe, share / total) for recipe, share in pick]
+
+# ...and back: one recipe when it runs alone, the list when there are several
+def pick_of(split):
+    split = [(recipe, share) for recipe, share in split if share > SHORT_TOLERANCE]
+    merged = {}
+    for recipe, share in split:
+        merged[recipe] = merged.get(recipe, 0) + share
+    if len(merged) == 1:
+        return next(iter(merged))
+    return [(recipe, share) for recipe, share in merged.items()]
+
+# A fluid in its can or its tank - Packaged Water, Packaged Fuel, ... It is
+# always brought in by hand, never made where it is used: a factory taking a
+# packaged fluid takes it as it arrives, by train or by truck, packed where
+# the fluid is. Packing it on the spot from the fluid the same factory would
+# have to pipe in anyway says nothing - and only feeds an unpackager the cans
+# it hands back. So the cans an unpackager gives back go nowhere, and leave
+# as a byproduct. Asked for as an output, it is made all the same.
+PACKAGED_PREFIX = "Packaged "
+
+def is_packaged(item):
+    return item.display_name.startswith(PACKAGED_PREFIX)
+
+# Who takes `item` from `target`, and who each of them gets it from: [(taker,
+# {supplier: flow})], every supplier of that item into the taker - `target`
+# among them - but the ones only handing over their leftovers. A byproduct
+# only takes what is spare, and the power node is fed by generators alone, so
+# neither is a taker here.
+def primary_supply(target, item):
+    made = target.entry_for(target.products, item)
+    if made is None:
+        return []
+    takers = []
+    for mother in made["to"]:
+        if (is_byproduct(mother) or is_power_node(mother) or mother is target
+                or is_surplus_taker(made, mother)):
+            continue
+        suppliers = {}
+        if isinstance(mother, Output_Node):
+            # an output keeps no record of who supplies it: it is read off
+            # every recipe delivering into it
+            for daughter in mother.daughter_nodes:
+                entry = daughter.entry_for(daughter.products, item)
+                if entry is not None and mother in entry["to"] and not is_surplus_taker(entry, mother):
+                    suppliers[daughter] = entry["to"][mother]
+        else:
+            entry = mother.entry_for(mother.ingredients, item)
+            for supplier, flow in entry["from"].items():
+                given = supplier.entry_for(supplier.products, item)
+                if given is not None and not is_surplus_taker(given, mother):
+                    suppliers[supplier] = flow
+        takers.append((mother, suppliers))
+    return takers
+
+# Every machine of `nodes` taking `item` from a recipe of its own - the
+# outputs left out, which their cards answer for - and who it gets it from,
+# leftovers aside: [(taker, {supplier: flow})]. What the recipe manager of an
+# item works on.
+def inner_supply(nodes, item):
+    takers = []
+    for node in nodes:
+        if not isinstance(node, Recipe_Node) or node.merged_into is not None:
+            continue
+        entry = node.entry_for(node.ingredients, item)
+        if entry is None:
+            continue
+        suppliers = {}
+        for supplier, flow in entry["from"].items():
+            given = supplier.entry_for(supplier.products, item)
+            if (isinstance(supplier, Recipe_Node) and supplier is not node and given is not None
+                    and not is_surplus_taker(given, node)):
+                suppliers[supplier] = flow
+        if suppliers:
+            takers.append((node, suppliers))
+    return takers
 
 # every ingredient still made by a supplier of its own, linked to whatever
 # other recipe makes that item spare. Returns whether any link was made.
@@ -796,9 +927,21 @@ class Node():
     # ({Item: Recipe}) picks the recipe every other node making that item runs.
     # `node_choices` ({(Item, mother's Recipe): Recipe}) picks it for just the
     # nodes making that item for a machine running that recipe, over the other.
+    # `extra_draw` is what draws power from outside the tree (see set_extra_draw).
+    # `consumers` is the buildings that only draw power, [(PowerBuilding,
+    # count)]: a node each, drawing on the power node like any machine.
     @staticmethod
-    def get_nodes_from_outputs(outputs, recipe_choices=None, node_choices=None):
+    def get_nodes_from_outputs(outputs, recipe_choices=None, node_choices=None, extra_draw=None, consumers=None):
         build = Build([], [], recipe_choices, node_choices)
+        if extra_draw:
+            set_extra_draw(build.nodes, extra_draw)
+            build.steps.append(snapshot(build.nodes))
+        for building, count in consumers or ():
+            if building is not None and count > 0:
+                build.nodes.append(Consumer_Node(building, count))
+        if any(isinstance(node, Consumer_Node) for node in build.nodes):
+            refresh_power(build.nodes)
+            build.steps.append(snapshot(build.nodes))
 
         # Loop 0, add the output nodes - one per item, however many outputs ask
         # for it: an item wanted twice, each time from a different recipe, is
@@ -859,7 +1002,8 @@ class Node():
         reached = set()
         stack = [node for node in nodes
                  if (isinstance(node, Output_Node) and not node.is_byproduct)
-                 or (is_power_node(node) and node.needed_rate > 0)]
+                 or (is_power_node(node) and node.needed_rate > 0)
+                 or isinstance(node, Consumer_Node)]
         while stack:
             node = stack.pop()
             if node in reached or node is target:
@@ -894,6 +1038,72 @@ class Node():
                 build.grow(mother, item, rate)
         return build.finish(), removed
 
+    # the finished tree `nodes` with `recipe` run beside `target` rather than
+    # in its place: of every item the new recipe makes that `target` supplies,
+    # `share` of what each of its takers gets from all its suppliers is now
+    # made the new way - the suppliers it had, `target` among them, each
+    # giving up that share of what they hand it - and the new recipe's node is
+    # made under those takers, its subtree growing step by step as a build
+    # does. A supplier left making nothing leaves with what only it needed.
+    #
+    # Returns the steps from the tree as it stood to the new one.
+    @staticmethod
+    def add_recipe(nodes, target, recipe, share, recipe_choices=None, node_choices=None):
+        nodes = list(nodes)
+        steps = [snapshot(nodes, target)]
+        share = min(max(share, 0.0), 1.0)
+        makes = [entry["item"] for entry in recipe.products]
+        build = Build(nodes, steps, recipe_choices, node_choices)
+        for item in [entry["item"] for entry in target.products if entry["item"] in makes]:
+            for mother, suppliers in primary_supply(target, item):
+                # Each taker's suppliers are cut down right before its new
+                # supplier is written in, never all of them first: sizing the
+                # graph between the two - which any merge does - would stretch
+                # the cut suppliers back up to all the taker asks for.
+                total = sum(suppliers.values())
+                for supplier, flow in suppliers.items():
+                    kept = flow * (1 - share)
+                    supplier.entry_for(supplier.products, item)["to"][mother] = kept
+                    if not isinstance(mother, Output_Node):
+                        mother.entry_for(mother.ingredients, item)["from"][supplier] = kept
+                if total * share <= SHORT_TOLERANCE * max(1, total):
+                    continue
+                build.focus_on(mother)
+                build.grow(mother, item, total * share, recipe, from_surplus=False)
+        return build.finish()
+
+    # the finished tree `nodes` with `item` made for every machine taking it
+    # (see inner_supply) the way `split` says - [(Recipe, share)], or one
+    # Recipe: each recipe of it making that share of what each of them takes.
+    # A recipe already supplying a machine has its flow set, a new one is
+    # grown under it the way a build does, and one left out of `split` makes
+    # it nothing more - leaving with what only it needed.
+    #
+    # Returns the steps from the tree as it stood to the new one.
+    @staticmethod
+    def resplit(nodes, item, split, recipe_choices=None, node_choices=None):
+        nodes = list(nodes)
+        wanted = dict(split_of(split))
+        takers = inner_supply(nodes, item)
+        steps = [snapshot(nodes, takers[0][0] if takers else None)]
+        build = Build(nodes, steps, recipe_choices, node_choices)
+        for mother, suppliers in takers:
+            # set right before the new suppliers are written in, never all at
+            # once first (see add_recipe)
+            total = sum(suppliers.values())
+            running = set()
+            for supplier, flow in suppliers.items():
+                kept = total * wanted.get(supplier.recipe, 0.0)
+                supplier.entry_for(supplier.products, item)["to"][mother] = kept
+                mother.entry_for(mother.ingredients, item)["from"][supplier] = kept
+                running.add(supplier.recipe)
+            for recipe, share in wanted.items():
+                if recipe in running or total * share <= SHORT_TOLERANCE * max(1, total):
+                    continue
+                build.focus_on(mother)
+                build.grow(mother, item, total * share, recipe, from_surplus=False)
+        return build.finish()
+
 # one build in progress: the nodes, the steps recorded so far, and the recipe
 # each node already runs, for later ones of the same recipe to merge into
 class Build:
@@ -916,25 +1126,25 @@ class Build:
         if not self.steps or self.steps[-1]["focus"] is not mother:
             self.steps.append(snapshot(self.nodes, mother))
 
-    # the recipe picked for `item` made for `mother`: for that node alone
-    # first, then for every node making the item; None is the item's default
+    # the recipes picked for `item` made for `mother`, as a split (see
+    # split_of): for that node alone first, then for every node making the
+    # item; None is the item's default
     def pick(self, item, mother):
         chosen = getattr(mother, "recipe", None)
-        return self.node_choices.get((item, chosen)) or self.recipe_choices.get(item)
+        return split_of(self.node_choices.get((item, chosen)) or self.recipe_choices.get(item))
 
     # `rate` of `item` for `mother`, then everything under what makes it,
     # layer by layer. The queue grows while it is walked: that is what carries
     # this subtree down before the next one is started.
     #
     # `recipe` is the recipe to make it with; without one an output's item
-    # takes its default, anything else the recipe picked for it (see pick).
+    # takes its default, anything else the recipes picked for it (see pick).
     def grow(self, mother, item, rate, recipe=None, from_surplus=True):
         if recipe is None and not isinstance(mother, Output_Node):
-            recipe = self.pick(item, mother)
-        queue = []
-        child = self.add_supplier(mother, item, rate, recipe, from_surplus)
-        if child is not None:
-            queue.append(child)
+            split = self.pick(item, mother)
+        else:
+            split = [(recipe, 1.0)]
+        queue = self.add_supplier(mother, item, rate, split, from_surplus)
         for node in queue:
             for made in [entry["item"] for entry in node.recipe.ingredients]:
                 # read again each time: every merge resizes the whole graph
@@ -943,16 +1153,15 @@ class Build:
                 if missing <= SHORT_TOLERANCE * max(1, entry["rate"]):
                     continue
                 self.focus_on(node)
-                child = self.add_supplier(node, made, missing, self.pick(made, node))
-                if child is not None:
-                    queue.append(child)
+                queue.extend(self.add_supplier(node, made, missing, self.pick(made, node)))
 
-    # one supplier more for `rate` of `item` into `node`: what other recipes
+    # suppliers more for `rate` of `item` into `node`: what other recipes
     # make of it spare first (unless `from_surplus` is off), then a hand source
-    # when nothing crafts it, or a recipe node - merged into the one already
-    # running that recipe when there is one. Returns the new recipe node when it
-    # stays, for its own ingredients to be supplied; None otherwise.
-    def add_supplier(self, node, item, rate, recipe=None, from_surplus=True):
+    # when nothing crafts it, or a recipe node per recipe of `split` ([(Recipe,
+    # share)]), each for its share - merged into the one already running that
+    # recipe when there is one. Returns the new recipe nodes that stay, for
+    # their own ingredients to be supplied.
+    def add_supplier(self, node, item, rate, split=((None, 1.0),), from_surplus=True):
         nodes, steps = self.nodes, self.steps
         if from_surplus and not isinstance(node, Output_Node):
             taken = take_surplus(node, item, rate, nodes)
@@ -963,29 +1172,39 @@ class Build:
                 entry = node.entry_for(node.ingredients, item)
                 rate = entry["rate"] - sum(entry["from"].values())
                 if rate <= SHORT_TOLERANCE * max(1, entry["rate"]):
-                    return None
+                    return []
 
-        # nothing crafts it: a source, and the end of this branch
-        if not item.recipes:
+        # nothing crafts it - or it comes packaged, brought in by hand for
+        # any machine taking it (see is_packaged): a source, and the end of
+        # this branch
+        if not item.recipes or (is_packaged(item) and not isinstance(node, Output_Node)):
             source = Manual_Node([node], item, rate)
             source.layer = node.layer + 1
             source.deliver(item, node, rate)
             node.supply(item, source, rate)
             nodes.append(source)
             steps.append(snapshot(nodes, self.focus))
-            return None
+            return []
 
-        child = Recipe_Node([node], item, rate, recipe=recipe)
-        child.layer = node.layer + 1
-        if not isinstance(node, Output_Node):
-            node.supply(item, child, rate)
-        nodes.append(child)
-        steps.append(snapshot(nodes, self.focus))
+        # Every share is written in as supplying `node` before any of them
+        # merges: a merge sizes the whole graph again, and a node short of
+        # what it asks for has its suppliers' shares stretched to cover all of
+        # it - the first recipe would take the whole flow, and the split be lost.
+        children = []
+        for recipe, share in split:
+            if share * rate <= SHORT_TOLERANCE * max(1, rate):
+                continue
+            child = Recipe_Node([node], item, rate * share, recipe=recipe)
+            child.layer = node.layer + 1
+            if not isinstance(node, Output_Node):
+                node.supply(item, child, rate * share)
+            nodes.append(child)
+            steps.append(snapshot(nodes, self.focus))
+            children.append(child)
         # a node that merged away is not queued - the twin it became already
         # has its subtree, resized to the demand the merge added
-        if merge_if_needed(child, self.recipes, nodes, steps, self.focus) is child:
-            return child
-        return None
+        return [child for child in children
+                if merge_if_needed(child, self.recipes, nodes, steps, self.focus) is child]
 
     def finish(self):
         nodes, steps = self.nodes, self.steps
@@ -1015,6 +1234,16 @@ class Build:
             solve_rates(nodes)
             idle = idle_nodes(nodes)
             refresh_byproducts(nodes)
+            steps.append(snapshot(nodes, self.focus))
+
+        # The leftovers read once more off the settled rates, in a step of
+        # their own if they moved. A byproduct is read whenever a node or a
+        # merge lands, against the rates as they stand then - and a change to
+        # a tree already built (a recipe switched, a share moved to another
+        # recipe) hands a node less to make before it has been resized to it:
+        # what it made for the old share was booked as surplus, and stayed.
+        solve_rates(nodes)
+        if refresh_byproducts(nodes):
             steps.append(snapshot(nodes, self.focus))
 
         # the highlight comes off in a step of its own, the mirror of the one
@@ -1098,9 +1327,16 @@ class Power_Node(Node):
     def __init__(self):
         super().__init__()
         self.item = POWER_ITEM
-        self.rate = 0.0          # what the machines under it draw
+        self.rate = 0.0          # what everything draws: the machines under it, and the extra
         self.generated = 0.0     # what the generators over it make
         self.needed_rate = 0.0   # how much generation was asked for
+        self.machine_rate = 0.0  # what the machines under it draw, alone
+        self.extra = []          # what draws on it from outside the tree (see set_extra_draw)
+        # what its augmenters add to the whole grid, as a share of that grid's
+        # power (see refresh_power) - and that share in megawatts, once the
+        # grid it is on says how much it makes (set by whoever knows the grid)
+        self.boost_fraction = 0.0
+        self.boost = 0.0
         self.picture = ""
         self.products = [{"item": POWER_ITEM, "rate": 0.0, "to": {}}]
         # asking for power is asking this node for it: the generators that
@@ -1108,9 +1344,34 @@ class Power_Node(Node):
         self.ingredients = [{"item": POWER_ITEM, "rate": 0.0, "from": {}}]
 
     def recalculate(self):
-        self.rate = self.products[0]["rate"] = sum(self.products[0]["to"].values())
+        self.machine_rate = sum(self.products[0]["to"].values())
+        self.rate = self.products[0]["rate"] = self.machine_rate + sum(entry["power"] for entry in self.extra)
         self.ingredients[0]["rate"] = self.needed_rate
         self.generated = sum(self.ingredients[0]["from"].values())
+
+    # what it makes with its augmenters' boost (see boost) - what it says it makes
+    @property
+    def made(self):
+        return self.generated + self.boost
+
+# A building that only draws power - a train station, a radar tower - asked
+# for by the output panel's Consumer list: `count` of them, drawing what they
+# draw on the power node, nothing going in or coming out. It stands on the
+# map as a node of its own, its line running up to the power node.
+class Consumer_Node(Node):
+    def __init__(self, building, count):
+        super().__init__()
+        self.building = building
+        self.count = count
+        self.machine_nb = count          # how many stand, as a machine count is read
+        self.needed_power = building.power * count
+        self.picture = building.picture
+        self.ingredients = [{"item": POWER_ITEM, "rate": self.needed_power, "from": {}}]
+        self.products = []
+
+    @property
+    def item(self):
+        return None
 
 class Manual_Node(Node):
     def __init__(self, mother_nodes, item, needed_rate=0):

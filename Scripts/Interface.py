@@ -5,6 +5,8 @@ import json
 import math
 import time
 import html
+import ast
+import operator
 from PySide6.QtWidgets import (
     QApplication, QGraphicsView, QGraphicsScene, QMainWindow,
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTabWidget, QTabBar, QPushButton,
@@ -13,7 +15,7 @@ from PySide6.QtWidgets import (
     QGraphicsItem, QGraphicsRectItem, QGraphicsTextItem, QGraphicsPixmapItem, QGraphicsPathItem,
     QAbstractScrollArea, QAbstractButton,
     QGraphicsPolygonItem, QComboBox, QGraphicsDropShadowEffect, QSlider, QSizePolicy, QStyledItemDelegate,
-    QGridLayout, QMenu, QStyle, QStyleOption
+    QGridLayout, QMenu, QStyle, QStyleOption, QFrame
 )
 from PySide6.QtGui import (
     QPainter, QPainterPath, QPen, QBrush, QColor, QShortcut, QKeySequence, QIcon, QPixmap, QFont,
@@ -27,7 +29,7 @@ from PySide6.QtCore import (
 import search
 from search import (
     Node, Output_Node, Recipe_Node, Manual_Node, Power_Node, All_Items, All_Machines, All_Recipes,
-    set_miner_mark, construction_report, recipes_report, supplied_items, POWER_ITEM, is_power_node,
+    set_miner_mark, construction_report, recipes_report, POWER_ITEM, is_power_node,
     power_for, power_range_for
 )
 import data_maker
@@ -269,6 +271,11 @@ ACCENT_SHADES = {
     "yellow": {"base": "#e0b23c", "hover": "#c99d31", "press": "#a88027", "text": "#f0cf7a",
                "active": "rgba(224, 178, 60, 0.35)", "active_hover": "rgba(224, 178, 60, 0.50)",
                "banner": "#4f462b"},
+    # what draws power: a muted brick red, its own shades - nothing else in
+    # the app is written in them, so swapping them out touches nothing else
+    "red":    {"base": "#d0584b", "hover": "#b94e43", "press": "#a1453b", "text": "#ee958b",
+               "active": "rgba(208, 88, 75, 0.35)", "active_hover": "rgba(208, 88, 75, 0.50)",
+               "banner": "#4f302c"},
 }
 # The switch is made in one go, and only looks eased: the window as it stood
 # is laid over it as a picture, which fades away to show the other color
@@ -357,6 +364,8 @@ APPDATA_SAVE_DELAY = 700   # ms of quiet before a change is written out
 def node_key(node):
     if is_power_node(node):
         return "power"
+    if isinstance(node, search.Consumer_Node):
+        return f"consumer:{node.building.full_name}"
     if isinstance(node, Recipe_Node):
         return f"recipe:{node.recipe.full_name}"
     item = getattr(node, "item", None)
@@ -406,9 +415,23 @@ def saved_options():
         "home_show_power": panel_options["home_show_power"],
         "recipe_choices": {item.full_name: recipe.full_name
                            for item, recipe in panel_options["recipe_choices"].items()},
-        "node_recipe_choices": [[item.full_name, mother.full_name, recipe.full_name]
+        "node_recipe_choices": [[item.full_name, mother.full_name, saved_pick(recipe)]
                                 for (item, mother), recipe in panel_options["node_recipe_choices"].items()],
     }
+
+# One node's recipe pick as the save file has it: the recipe's name - or, for
+# an item shared between several recipes, [[name, share], ...]
+def saved_pick(pick):
+    if isinstance(pick, (list, tuple)):
+        return [[recipe.full_name, share] for recipe, share in pick]
+    return pick.full_name
+
+# ...and read back: None when the data no longer has what it names
+def loaded_pick(saved):
+    if isinstance(saved, list):
+        split = [(All_Recipes[name], share) for name, share in saved if name in All_Recipes]
+        return search.pick_of(split) if split else None
+    return All_Recipes.get(saved)
 
 def load_options(saved):
     for key in ("miners_mark", "options_collapsed", "outputs_compact", "toolbar_collapsed", "tabs_wrap", "conveyor_lvl", "pipe_lvl", "arrow_mode",
@@ -422,19 +445,34 @@ def load_options(saved):
         for item, recipe in saved.get("recipe_choices", {}).items()
         if item in All_Items and recipe in All_Recipes}
     panel_options["node_recipe_choices"] = {
-        (All_Items[item], All_Recipes[mother]): All_Recipes[recipe]
+        (All_Items[item], All_Recipes[mother]): loaded_pick(recipe)
         for item, mother, recipe in saved.get("node_recipe_choices", [])
-        if item in All_Items and mother in All_Recipes and recipe in All_Recipes}
+        if item in All_Items and mother in All_Recipes and loaded_pick(recipe) is not None}
+
+# An output card as the save file has it: its item, its rate, its recipe and
+# its list - and, made several ways at once, every recipe with what it makes
+# ("parts": [[name, rate], ...], the first being "recipe").
+def saved_card(entry):
+    recipe = entry["get_recipe"]()
+    card = {"item": entry["item"].full_name, "rate": entry["get_rate"](),
+            "recipe": recipe.full_name if recipe else None, "side": entry["side"]}
+    parts = entry["get_parts"]()
+    if len(parts) > 1:
+        card["parts"] = [[made.full_name if made else None, rate] for made, rate in parts]
+    return card
+
+# ...and its recipes read back: [(Recipe or None, rate)], one for a card
+# made one way
+def card_shares(card):
+    if card.get("parts"):
+        return [(All_Recipes.get(name), rate or 0) for name, rate in card["parts"]]
+    return [(All_Recipes.get(card.get("recipe")), card.get("rate") or 0)]
 
 def saved_project(page):
     if not page.loaded():
         return {**page.saved, "name": page.project_name, "color": page.tab_color, "tab_page": page.tab_page,
                 "compact": page.compact, "hub_off": page.hub_off}
-    cards =[{"item": entry["item"].full_name,
-              "rate": entry["get_rate"](),
-              "recipe": entry["get_recipe"]().full_name if entry["get_recipe"]() else None,
-              "side": entry["side"]}
-             for entry in page.panel.cards()]
+    cards = [saved_card(entry) for entry in page.panel.cards()]
     view = page.view
     steps = getattr(view, "build_steps", None)
     project = {"name": page.project_name, "color": page.tab_color, "tab_page": page.tab_page,
@@ -454,6 +492,9 @@ def saved_project(page):
     done = getattr(view, "completed", None)
     if done:
         project["built_nodes"] = sorted(done)
+    pumps = getattr(view, "pumps", None)
+    if pumps:
+        project["pumps"] = [[list(key), placed] for key, placed in pumps.items() if placed]
     return project
 
 def save_appdata(window):
@@ -2477,8 +2518,9 @@ def make_project_tabs():
                 opened.canvas.match_compact()
                 opened.canvas.sync_view_options()
                 opened.panel.sync_options()
+                opened.canvas.refresh_grid()   # the grid may have moved in another project
         side = opened.panel.current_side() if isinstance(opened, ProjectPage) and opened.loaded() else "output"
-        set_accent("yellow" if side == "generator" else "blue", tabs.window())
+        set_accent(SIDE_ACCENTS.get(side, "blue"), tabs.window())
         for index in range(tabs.count()):
             fit_tab(index)
         paint_open_name()
@@ -3789,9 +3831,20 @@ class GridGraphicsView(QGraphicsView):
     # for a box rather than for any item at all is what lets a graph thick with
     # lines still be dragged: a line lying under the cursor is not something to
     # grab, and the map was refusing to move wherever one crossed.
+    # A pump, or a pipe offering one under the mouse (see ConveyorEdge.hoverMoveEvent),
+    # takes the click itself: the map is not dragged from there
+    def pump_at(self, point):
+        for item in self.items(point):
+            if isinstance(item, PumpItem) and not item.ghost:
+                return True
+            if isinstance(item, ConveyorEdge) and item.pump_ghost is not None and item.pump_ghost.isVisible():
+                return True
+        return False
+
     def mousePressEvent(self, event):
         grabbing = event.button() == Qt.MiddleButton or (
             event.button() == Qt.LeftButton and self.box_at(event.position().toPoint()) is None
+            and not self.pump_at(event.position().toPoint())
         )
         if grabbing:
             self.panning = True
@@ -4207,6 +4260,39 @@ def draw_close(p, c):
     p.setPen(pen)
     p.drawLine(QPointF(4, 4), QPointF(12, 12))
     p.drawLine(QPointF(12, 4), QPointF(4, 12))
+
+# Taking one recipe off a list - not shutting anything: a cross, but a
+# small, quiet one, so it never reads as the close cross a card or a panel
+# has in its corner
+def draw_remove_recipe(p, c):
+    pen = QPen(c, 1.5)
+    pen.setCapStyle(Qt.RoundCap)
+    p.setPen(pen)
+    p.drawLine(QPointF(5, 5), QPointF(11, 11))
+    p.drawLine(QPointF(11, 5), QPointF(5, 11))
+
+# The button taking one recipe off a list: narrow, grey at rest and only
+# lighting up under the mouse - and set in from the line's right end
+# (REMOVE_RECIPE_INSET, kept free by whoever lays it out), out of the column
+# of the bigger cross that shuts the card. Greyed out further, and taking no
+# click, when `alone`: something has to make the item.
+REMOVE_RECIPE_SYMBOL_SIZE = 14
+REMOVE_RECIPE_BUTTON_WIDTH = 20
+REMOVE_RECIPE_INSET = 8
+REMOVE_RECIPE_COLORS = (("rest", TEXT_FAINT), ("hover", TEXT_STRONG), ("pressed", TEXT_NORMAL))
+
+def make_remove_recipe_button(height, alone=False):
+    button = make_output_icon_button("", size=REMOVE_RECIPE_BUTTON_WIDTH)
+    button.setFixedSize(REMOVE_RECIPE_BUTTON_WIDTH, height)
+    if alone:
+        button.setIcon(symbol_icon(draw_remove_recipe, TEXT_DISABLED))
+        button.setIconSize(QSize(REMOVE_RECIPE_SYMBOL_SIZE, REMOVE_RECIPE_SYMBOL_SIZE))
+        button.setEnabled(False)
+        button.setToolTip("The only recipe making it cannot be taken off")
+    else:
+        set_drawn_symbol(button, draw_remove_recipe, REMOVE_RECIPE_SYMBOL_SIZE, REMOVE_RECIPE_COLORS)
+        button.setToolTip("Remove this recipe - its rate is left to share out")
+    return button
 
 # a house: its roof a peak, its door cut out of the front
 def draw_home(p, c):
@@ -5217,6 +5303,10 @@ NODE_IDLE_OPACITY = 0.5     # a node carrying no rate is faded rather than hidde
 NODE_MERGING_OPACITY = 0.6  # a temporary node, gone once the next step merges it
 
 NODE_INFO_GAP = 8           # space between a node and its info panel
+INFO_SNAP_DISTANCE = 60     # an info panel let go this close to its box's spot snaps back onto it
+INFO_SNAP_MS = 180          # ...gliding there
+INFO_RETRACT = 70           # px an info panel slides back toward its box as it shuts with the recipe manager out
+INFO_RETRACT_MS = 200       # ...fading out the while
 NODE_INFO_WIDTH = 300
 NODE_INFO_TITLE_FONT_SIZE = 14
 NODE_INFO_TEXT_FONT_SIZE = 12
@@ -5230,15 +5320,22 @@ NODE_INFO_BUILT_LABEL = "Built  ✓"
 # the button in a node's top right corner that the panel hangs off. The info
 # stays shut until it is pressed: a click on the box itself only picks the node
 # out, so you can click your way around the map without a panel over it.
-NODE_INFO_BUTTON_SIZE = 44       # small: the name beside it gets the room
-NODE_INFO_COMPACT_BUTTON_SIZE = 40   # on a compact box, which has nothing else on it
-NODE_INFO_BUTTON_MARGIN = 10      # from the box's right border (and a compact box's top)
-NODE_INFO_BUTTON_TOP = 26         # from the box's top
+NODE_INFO_BUTTON_SIZE = 54       # the square that takes the click, and lights up under the mouse
+NODE_INFO_COMPACT_BUTTON_SIZE = 48   # on a compact box, which has nothing else on it
+NODE_INFO_BUTTON_MARGIN = 14      # the square as far from the box's top as from its right border
+NODE_INFO_COMPACT_BUTTON_MARGIN = 10
 NODE_INFO_BUTTON_GAP = 6          # the name keeps this much clear of it
 NODE_INFO_BUTTON_GROUND_ALPHA = 38   # its soft ground, under the mouse or while open
 NODE_INFO_CARET_WIDTH = 1.3          # lighter than the step bar's own chevrons, still clear on the small button
 NODE_INFO_CARET_OPEN_ANGLE = 180     # open, it points back left at the panel it would close
 NODE_INFO_CARET_TURN_MS = 160        # the swing between the two
+NODE_INFO_CARET_HEIGHT = 32          # the chevron itself, tip to tip, whatever the square round it
+NODE_INFO_COMPACT_CARET_HEIGHT = 29
+
+# Where a box `width` wide puts its caret's square, `side` across: `margin`
+# from its right border and as far from its top. Returns (x, y).
+def caret_spot(width, side, margin=NODE_INFO_BUTTON_MARGIN):
+    return width - margin - side, margin
 NODE_INFO_MARGIN = 8        # keeps the panel clear of the view's own edges
 NODE_INFO_MIN_HEIGHT = 120  # never squeezed past this, however short the view gets
 NODE_INFO_SKIP_FIELDS = {"coordinate", "possible_recipes"}   # layout bookkeeping / redundant with recipe
@@ -5334,6 +5431,18 @@ CONVEYOR_LIVE_COLOR = TAB_INDICATOR_COLOR
 # not, rather than over their icons and text.
 CONVEYOR_Z = -1
 CONVEYOR_LIVE_Z = -0.8
+CONVEYOR_LABEL_Z = -0.5        # a line's words: over every line, still under the boxes
+CONVEYOR_LIVE_LABEL_Z = -0.4   # ...and a picked-out line's over the others' words
+PUMP_Z = -0.6                  # a pump on a pipe: over the lines, under their words
+PUMP_SIZE = 34                 # its square, along the line
+PUMP_HOVER_WIDTH = 22          # how close to a pipe the mouse has to be to offer one
+PUMP_END_MARGIN = 0.07         # kept this share of the line clear at each end: out of the boxes
+PUMP_GHOST_OPACITY = 0.55      # the one offered under the mouse, not placed yet
+PUMP_BG = "#22313a"            # its ground: the dark of a pipe's own blue
+PUMP_HOVER_BG = "#2d4250"
+PUMP_LINE_TUCK = PUMP_SIZE / 2      # its power line runs into its square no further than its middle
+PUMP_POP_MS = 220                   # a pump just put down: from a dot to its size
+PUMP_SETTINGS_FADE_MS = 140         # its settings coming in
 CONVEYOR_FADE_SPAN = 0.3   # how much of a two-colored line the change takes: the rest is one color or the other
 CONVEYOR_GLOW_MS = 160     # the light coming up along a picked-out node's lines, and going off again
 CONVEYOR_LOOP_FLIP_MS = 260   # a loop swinging from under its box to over it, or back
@@ -5554,8 +5663,7 @@ class PowerNodeItem(QGraphicsRectItem):
         if on_info is not None:
             self.info_button = NodeInfoButton(NODE_INFO_BUTTON_SIZE, POWER_COLOR,
                                               lambda: on_info(node, self), self)
-            self.info_button.setPos(POWER_NODE_WIDTH - NODE_INFO_BUTTON_MARGIN - NODE_INFO_BUTTON_SIZE,
-                                    NODE_INFO_BUTTON_TOP)
+            self.info_button.setPos(*caret_spot(POWER_NODE_WIDTH, NODE_INFO_BUTTON_SIZE))
 
         # the bolt the toolbar's own power button is drawn with, in place of
         # the picture the other nodes carry
@@ -5580,7 +5688,7 @@ class PowerNodeItem(QGraphicsRectItem):
 
         # what the generators make first, in green, and what the machines take
         # under it, in red
-        for label, watts, color in ((POWER_MADE_LABEL, node.generated, POWER_MADE_COLOR),
+        for label, watts, color in ((POWER_MADE_LABEL, node.made, POWER_MADE_COLOR),
                                     (POWER_DRAWN_LABEL, node.rate, POWER_DRAWN_COLOR)):
             line = SceneText(f"{label} {format_power(watts)}", self)
             line.setDefaultTextColor(QColor(color))
@@ -5591,7 +5699,7 @@ class PowerNodeItem(QGraphicsRectItem):
         # the two of them added up, beside them: what is left over if the
         # generators are ahead, what is missing if they are not, in the color of
         # whichever side is winning
-        spare = node.generated - node.rate
+        spare = node.made - node.rate
         total = SceneText(("+" if spare >= 0 else "−") + format_power(abs(spare)), self)
         total.setDefaultTextColor(QColor(POWER_MADE_COLOR if spare >= 0 else POWER_DRAWN_COLOR))
         total_room = (POWER_NODE_WIDTH - text_x - NODE_ICON_MARGIN) * POWER_TOTAL_SHARE
@@ -5724,7 +5832,9 @@ class PowerEdge(QGraphicsPathItem):
 
     # laid again from scratch: its machine was dragged, or the graph grew and
     # took the power node with it
-    def set_ends(self, box_top, rail_y, power_point):
+    # `tuck` is how far the line runs on into what it leaves from (see below):
+    # a box's own depth, or less for a pump, smaller than a box
+    def set_ends(self, box_top, rail_y, power_point, tuck=None):
         # a line starts at the tip of the arrow giving the power and stops at
         # the border where the arrow taking it in begins, the way a conveyor
         # runs between exit_point and entry_point: the triangle carries the
@@ -5737,13 +5847,18 @@ class PowerEdge(QGraphicsPathItem):
         self.top = box_top          # where it leaves the machine
         self.end = power_point      # ...and where it meets the power node
         self.rail_y = min(rail_y, box_top.y())
-        path = QPainterPath(box_top)
+        # Both ends run on a little into their boxes, as a conveyor's do (see
+        # ConveyorEdge.set_endpoints): the lines are drawn under the boxes, so
+        # the round cap ends up hidden under the box and its arrow, and the
+        # line comes out from under the arrow's tip instead of capping it.
+        path = QPainterPath(QPointF(box_top.x(), box_top.y() + (CONVEYOR_NODE_OVERLAP if tuck is None else tuck)))
         path.lineTo(QPointF(box_top.x(), self.rail_y))
         # only now does it turn: the pull is the drop it has left to make, so
         # the curve leans over rather than kinking
         pull = max(abs(power_point.y() - self.rail_y), GRID_SQUARE)
         path.cubicTo(QPointF(box_top.x(), self.rail_y - pull),
                      QPointF(power_point.x(), self.rail_y - pull * 0.4), power_point)
+        path.lineTo(QPointF(power_point.x(), power_point.y() - CONVEYOR_NODE_OVERLAP))
         self.setPath(path)
 
     # a thin line held to a minimum width on screen spills past its own bounds
@@ -5775,6 +5890,8 @@ class PowerEdge(QGraphicsPathItem):
 def node_label(node):
     if is_power_node(node):
         return "Power"
+    if isinstance(node, search.Consumer_Node):
+        return node.building.display_name
     if isinstance(node, (Output_Node, Manual_Node)):
         return node.item.display_name
     if isinstance(node, Recipe_Node):
@@ -5816,11 +5933,87 @@ def picture_exists(path):
 def picture_or_missing(path):
     return path if picture_exists(path) else MISSING_PICTURE
 
+# The buildings the image folder has no picture of, drawn rather than shown
+# as missing: one that only draws power (a plug), a pipeline pump (a pump
+# pushing up), and the alien power augmenter (a bolt in its ring). Each stands
+# in for a picture path, like POWER_PICTURE.
+CONSUMER_PICTURE = "<consumer>"
+PUMP_PICTURE = "<pump>"
+AUGMENTER_PICTURE = "<augmenter>"
+CONSUMER_PICTURE_COLOR = "#e86a5c"   # the red of power drawn, a touch softer
+PUMP_PICTURE_COLOR = "#5cc8e0"       # a pipe's water blue
+AUGMENTER_PICTURE_COLOR = "#b58cff"  # the alien violet of a somersloop
+AUGMENTER_MACHINE = "Build_AlienPowerBuilding_C"
+
+# a plug: its two pins over its body, the cord running off below
+def draw_consumer(p, c):
+    p.setPen(outline_pen(c, 1.4))
+    p.setBrush(Qt.NoBrush)
+    p.drawLine(QPointF(6, 1.5), QPointF(6, 5))
+    p.drawLine(QPointF(10, 1.5), QPointF(10, 5))
+    path = QPainterPath(QPointF(3.5, 5))
+    path.lineTo(12.5, 5)
+    path.lineTo(12.5, 8)
+    path.quadTo(12.5, 11.5, 8, 11.5)
+    path.quadTo(3.5, 11.5, 3.5, 8)
+    path.closeSubpath()
+    p.drawPath(path)
+    p.drawLine(QPointF(8, 11.5), QPointF(8, 14.5))
+
+# a pipeline pump, as it sits in a pipe: the pipe running through, a flange
+# either side, the pump's barrel between them, its motor block on top and an
+# arrow on the barrel for the way it pushes
+def draw_pump(p, c):
+    p.setPen(outline_pen(c, 1.3))
+    p.setBrush(Qt.NoBrush)
+    # the pipe, in and out
+    p.drawLine(QPointF(0.8, 10), QPointF(3, 10))
+    p.drawLine(QPointF(13, 10), QPointF(15.2, 10))
+    # its two flanges
+    p.drawLine(QPointF(3, 7.5), QPointF(3, 12.5))
+    p.drawLine(QPointF(13, 7.5), QPointF(13, 12.5))
+    # the barrel
+    p.drawRoundedRect(QRectF(4.5, 7, 7, 6), 1.5, 1.5)
+    # the motor on top of it
+    p.drawRect(QRectF(6, 3, 4, 4))
+    p.drawLine(QPointF(5, 3), QPointF(11, 3))
+    # the way it pushes
+    p.drawPolyline(QPolygonF([QPointF(6.5, 8.6), QPointF(9.2, 10), QPointF(6.5, 11.4)]))
+
+# the alien power augmenter: a bolt inside the ring it draws its power from
+def draw_augmenter(p, c):
+    p.setPen(outline_pen(c, 1.3))
+    p.setBrush(Qt.NoBrush)
+    p.drawEllipse(QRectF(1.5, 1.5, 13, 13))
+    filled(p, c)
+    p.drawPolygon(QPolygonF([QPointF(9, 3.5), QPointF(4.5, 9), QPointF(7.5, 9), QPointF(6.8, 12.5),
+                             QPointF(11.5, 7), QPointF(8.5, 7)]))
+
+# a machine's picture, drawn when the folder has none and it is one drawn here
+def machine_picture(machine):
+    path = getattr(machine, "picture", "")
+    if picture_exists(path):
+        return path
+    return AUGMENTER_PICTURE if getattr(machine, "full_name", "") == AUGMENTER_MACHINE else MISSING_PICTURE
+
+# a power-only building's picture: its own, else the plug or the pump
+def power_building_picture(building):
+    path = getattr(building, "picture", "")
+    if picture_exists(path):
+        return path
+    return PUMP_PICTURE if getattr(building, "category", "") == "pump" else CONSUMER_PICTURE
+
 # how a picture path is drawn instead of loaded - the draw function and its
 # color. None means the path is a real image the folder carries, to be loaded.
 def picture_drawing(path):
     if path == POWER_PICTURE:
         return draw_power, POWER_COLOR
+    if path == CONSUMER_PICTURE:
+        return draw_consumer, CONSUMER_PICTURE_COLOR
+    if path == PUMP_PICTURE:
+        return draw_pump, PUMP_PICTURE_COLOR
+    if path == AUGMENTER_PICTURE:
+        return draw_augmenter, AUGMENTER_PICTURE_COLOR
     if path == MISSING_PICTURE or not picture_exists(path):
         return draw_missing_picture, MISSING_PICTURE_COLOR
     return None
@@ -5828,16 +6021,18 @@ def picture_drawing(path):
 def node_picture(node):
     if is_power_node(node):
         return POWER_PICTURE
+    if isinstance(node, search.Consumer_Node):
+        return power_building_picture(node.building)
     if is_generator(node):
         # whatever else it makes, a generator is known by its building - what
         # it mainly makes is power, which has no picture of its own
-        return picture_or_missing(node.machine_picture)
+        return machine_picture(node.machine)
     if getattr(node, "item", None) is POWER_ITEM:
         return POWER_PICTURE   # an output asking for so many megawatts
     if isinstance(node, Recipe_Node):
         if panel_options["picture_mode"] == "item":
             return picture_or_missing(node.item_picture)
-        return picture_or_missing(node.machine_picture)
+        return machine_picture(node.machine)
     return picture_or_missing(getattr(node, "picture", ""))
 
 # what a node moves per minute, asked of any kind of node: a recipe is driven
@@ -5846,7 +6041,10 @@ def node_picture(node):
 # `values` is a step's record of what this node's numbers were at that moment,
 # from search.snapshot. The node object itself has moved on since - the build
 # kept merging and renumbering it - so its numbers are always read from there.
+# a consumer makes nothing: what it carries is the power it draws
 def node_rate(node, values):
+    if isinstance(node, search.Consumer_Node):
+        return node.needed_power
     return values["needed_rate"] if isinstance(node, Recipe_Node) else values["rate"]
 
 # sets the name's font to the biggest size, from NODE_FONT_SIZE down, at which
@@ -5908,6 +6106,8 @@ def fit_one_line(text, width, height, size):
 # part-clocked last building draws less than its share: power goes with the
 # clock to POWER_EXPONENT.
 def node_power(node, values):
+    if isinstance(node, search.Consumer_Node):
+        return node.building.power * values["machine_nb"]
     if not isinstance(node, Recipe_Node):
         return None
     return power_for(node, values["machine_nb"])
@@ -5915,6 +6115,12 @@ def node_power(node, values):
 # the two ends of that draw, for a recipe that swings over a range while it
 # crafts rather than drawing a steady number. None for every other recipe.
 def node_power_range(node, values):
+    if isinstance(node, search.Consumer_Node):
+        # an electric locomotive's draw swings with what it is doing
+        building = node.building
+        if building.power_max:
+            return building.power_min * values["machine_nb"], building.power_max * values["machine_nb"]
+        return None
     if not isinstance(node, Recipe_Node):
         return None
     return power_range_for(node, values["machine_nb"])
@@ -5932,6 +6138,12 @@ def format_power_range(low, high):
 # than "4.00", "1.5" rather than "1.50"
 def trimmed(value, places):
     text = f"{value:.{places}f}"
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+# a rate as the map and the panels write it: the same, with its thousands
+# marked - "1,200", "15", "7.5"
+def rate_number(value, places=2):
+    text = f"{value:,.{places}f}"
     return text.rstrip("0").rstrip(".") if "." in text else text
 
 def machine_count(machine_nb):
@@ -5977,11 +6189,13 @@ def node_display_lines(node, values):
     if is_mined(node):
         # an extractor's count says little - it hangs on the purity of the
         # nodes it lands on - so what they have to give is said instead
-        return node.recipe_name, f"{values['needed_rate']:.2f} {rate_unit(node.item)}"
+        return node.recipe_name, f"{rate_number(values['needed_rate'])} {rate_unit(node.item)}"
     if isinstance(node, Recipe_Node):
         return node.recipe_name, f"{node.machine.display_name}  × {machine_count(values['machine_nb'])}"
     if isinstance(node, (Output_Node, Manual_Node)):
-        return node.item.display_name, f"{values['rate']:.2f} {rate_unit(node.item)}"
+        return node.item.display_name, f"{rate_number(values['rate'])} {rate_unit(node.item)}"
+    if isinstance(node, search.Consumer_Node):
+        return node.building.display_name, f"Consumer  × {machine_count(values['machine_nb'])}"
     return node_label(node), ""
 
 def format_node_value(value):
@@ -5990,7 +6204,7 @@ def format_node_value(value):
     if isinstance(value, dict):
         # a flow entry reads as what moves, how much, and between which nodes
         if "item" in value and "rate" in value:
-            text = f"{format_node_value(value['item'])} {value['rate']:.2f} {rate_unit(value['item'])}"
+            text = f"{format_node_value(value['item'])} {rate_number(value['rate'])} {rate_unit(value['item'])}"
             ends = value.get("from") or value.get("to")
             if ends:
                 arrow = "←" if "from" in value else "→"
@@ -6017,6 +6231,8 @@ def node_info_fields(node):
 def node_kind(node):
     if is_power_node(node):
         return "Power"
+    if isinstance(node, search.Consumer_Node):
+        return "Consumer"
     if is_generator(node):
         return "Generator"
     if isinstance(node, Output_Node):
@@ -6158,6 +6374,19 @@ def info_label(text, color, size=NODE_INFO_TEXT_FONT_SIZE, bold=False, wrap=Fals
 # goes in and comes out, and every raw field under a More info toggle.
 # panel.wanted_height() is the height its content asks for; panel.on_resize,
 # set by whoever places it, is called when More info opens or shuts.
+# The item whose recipe manager a box's info panel opens: what it makes for
+# machines inside the tree - what it is run for first, when that is one of
+# them. None for a box making nothing but outputs and power, which their
+# cards answer for.
+def managed_item(node):
+    if not isinstance(node, Recipe_Node):
+        return None
+    for entry in sorted(node.products, key=lambda entry: entry["item"] is not node.needed_item):
+        if entry["item"] is not POWER_ITEM and any(
+                isinstance(mother, Recipe_Node) for mother, _ in search.primary_supply(node, entry["item"])):
+            return entry["item"]
+    return None
+
 def make_node_info_panel(parent):
     panel = QWidget(parent)
     panel.setObjectName("node_info_panel")
@@ -6174,8 +6403,12 @@ def make_node_info_panel(parent):
     panel.setFixedWidth(NODE_INFO_WIDTH)
 
     layout = QVBoxLayout(panel)
-    layout.setContentsMargins(14, 14, 14, 14)
+    layout.setContentsMargins(14, 4, 14, 14)
     layout.setSpacing(0)
+    # the strip it is dragged by, along its top (see PanelGrip)
+    grip = PanelGrip()
+    layout.addWidget(grip)
+    layout.addSpacing(4)
 
     # the content is rebuilt for each node inside this one holder
     body = QWidget()
@@ -6232,7 +6465,7 @@ def make_node_info_panel(parent):
             row = QHBoxLayout()
             row.setSpacing(8)
             name = info_label(item.display_name, name_color)
-            amount = info_label(f"{rate:,.2f} {rate_unit(item)}", rate_color)
+            amount = info_label(f"{rate_number(rate)} {rate_unit(item)}", rate_color)
             if tip:
                 name.setToolTip(tip)
                 amount.setToolTip(tip)
@@ -6290,8 +6523,17 @@ def make_node_info_panel(parent):
         tag.setStyleSheet(tag.styleSheet() +
                           f" background: rgba({color.red()}, {color.green()}, {color.blue()}, {NODE_INFO_TAG_ALPHA});"
                           f" border-radius: {HOVER_BORDER_RADIUS}px; padding: 1px 6px;")
+        # the box's own color, whichever list the panel has open: a recipe's
+        # blue is the accent's too, and would otherwise turn with it
+        tag.setProperty("fixed_accent", True)
         column.addWidget(tag, 0, Qt.AlignLeft)
         row.addLayout(column, 1)
+        # the heading is something to take the panel by, not text to select:
+        # its presses go through to the panel, which drags
+        for label in box.findChildren(QLabel):
+            label.setTextInteractionFlags(Qt.NoTextInteraction)
+            label.unsetCursor()
+        box.setCursor(Qt.OpenHandCursor)
         return box
 
     # the button that ticks a node off as built, and un-ticks it: the same
@@ -6365,11 +6607,28 @@ def make_node_info_panel(parent):
         return block
 
     showing = [None, None]   # the node on it now, and its numbers
+    heading = [None]         # its heading: with the strip over it, all it is taken hold of by
+
+    # Only its top takes it - the strip it is dragged by and the heading
+    # under it - whether a press at `point` (on the screen) is there. The
+    # rest is what it says, its buttons and its text to select.
+    def in_grab_area(point):
+        if grip.geometry().contains(panel.mapFromGlobal(point)):
+            return True
+        box = heading[0]
+        try:
+            return box is not None and box.isVisible() and box.rect().contains(box.mapFromGlobal(point))
+        except RuntimeError:
+            return False   # the last node's, gone
+
+    panel.in_grab_area = in_grab_area
 
     def set_node(node, values):
         showing[:] = [node, values]
         clear()
-        body_layout.addWidget(header(node))
+        panel.show_manager_open = lambda on: None   # the last node's button goes with it
+        heading[0] = header(node)
+        body_layout.addWidget(heading[0])
         body_layout.addWidget(make_panel_divider())
 
         if is_power_node(node):
@@ -6377,7 +6636,7 @@ def make_node_info_panel(parent):
             # the machines take, and whether that leaves anything over
             taking = sorted(node.products[0]["to"].items(), key=lambda pair: -pair[1])
             making = sorted(node.ingredients[0]["from"].items(), key=lambda pair: -pair[1])
-            spare = node.generated - node.rate
+            spare = node.made - node.rate
             # The machines whose draw is a range do not all peak at once, but
             # they can: the factory's own draw swings between the sum of their
             # low ends and the sum of their high ones, with every steady
@@ -6396,8 +6655,15 @@ def make_node_info_panel(parent):
                 else:
                     low, high = low + ends[0], high + ends[1]
                     swinging += 1
-            rows = [("Made", format_power(node.generated), POWER_MADE_COLOR),
+            rows = [("Made", format_power(node.made), POWER_MADE_COLOR),
                     ("Drawn", format_power(node.rate), POWER_DRAWN_COLOR)]
+            # what the augmenters add, and what it is a share of: the power of
+            # the whole grid the project is on
+            if node.boost_fraction > 0:
+                rows.insert(1, ("Augmented", f"+{format_power(node.boost)}&nbsp; "
+                                             f"<span style='color:{TEXT_MUTED}'>{node.boost_fraction * 100:.0f}% of "
+                                             f"{format_power(getattr(node, 'grid_base', 0.0))}</span>",
+                                POWER_MADE_COLOR))
             if swinging:
                 rows.append(("Between", format_power_range(low, high), POWER_DRAWN_COLOR))
             rows += [("Spare" if spare >= 0 else "Short", format_power(abs(spare)),
@@ -6424,6 +6690,24 @@ def make_node_info_panel(parent):
             if making:
                 body_layout.addWidget(power_rows("In", making, POWER_MADE_COLOR))
             body_layout.addWidget(power_rows("Out", taking, POWER_DRAWN_COLOR))
+            # what draws on it from outside the tree: the Consumer cards'
+            # buildings and the pumps along the pipes, a row each
+            if node.extra:
+                block = QWidget()
+                block_layout = QVBoxLayout(block)
+                block_layout.setContentsMargins(0, 0, 0, 0)
+                block_layout.setSpacing(4)
+                block_layout.addWidget(section_title("Also drawing"))
+                for entry in node.extra:
+                    row = QHBoxLayout()
+                    row.setSpacing(8)
+                    row.addWidget(picture_label(power_building_picture(entry.get("building")),
+                                                NODE_INFO_FLOW_PICTURE_SIZE))
+                    row.addWidget(info_label(f"{html.escape(entry['name'])}&nbsp; "
+                                             f"<b>× {rate_number(entry['count'])}</b>", TEXT_NORMAL), 1)
+                    row.addWidget(info_label(format_power(entry["power"]), POWER_DRAWN_COLOR))
+                    block_layout.addLayout(row)
+                body_layout.addWidget(block)
 
         elif isinstance(node, Recipe_Node):
             # the numbers of the step being shown, not of the node as it stands now
@@ -6437,26 +6721,10 @@ def make_node_info_panel(parent):
             elif clock > 1e-9:
                 built = f"1 building at {clock * 100:.0f}%"
             crafts = 60 / node.duration * machine_nb
-            # the recipe this one node runs - any recipe of anything it
-            # supplies: picking another rebuilds the tree
-            options = recipe_options(supplied_items(node), node.recipe)
-            # picking here rebuilds that node's subtree, which a locked graph
-            # does not allow: the row still shows what it runs, greyed out
-            if len(options) > 1 and panel.on_recipe_pick is not None:
-                line = QWidget()
-                line_layout = QHBoxLayout(line)
-                line_layout.setContentsMargins(0, 0, 0, 0)
-                line_layout.setSpacing(OUTPUT_RECIPE_GAP)
-                line_layout.addWidget(info_label("Recipe", TEXT_MUTED))
-                field, get_recipe = make_recipe_dropdown(
-                    node.needed_item, node.recipe, options=options,
-                    on_change=lambda: panel.on_recipe_pick(node, get_recipe()))
-                field.setToolTip(LOCKED_TOOLTIP if panel_options["locked"]
-                                 else "Switch this node's recipe and rebuild the tree")
-                field.setEnabled(not panel_options["locked"])
-                line.setEnabled(not panel_options["locked"])
-                line_layout.addWidget(field, 1)
-                body_layout.addWidget(line)
+            # No recipe is picked here: a box making something for machines
+            # inside the tree has its item's recipe manager, pulled out of
+            # this panel by the tab at its side, and one making an output has
+            # that output's card in the panel, both run the same way.
             # a generator's line says what it makes, in green; every other
             # machine's says what it takes, in red
             if is_generator(node):
@@ -6468,6 +6736,16 @@ def make_node_info_panel(parent):
                                 f"<b>× {machine_count(machine_nb)}</b>"),
                     ("Buildings", built),
                     power_row]
+            # An augmenter adds a share of the whole grid on top of its own:
+            # the grid's power going into it, and what comes out of that
+            boost = search.power_boost_of(node)
+            if boost > 0:
+                grid = next((getattr(mother, "grid_base", 0.0) for mother in node.mother_nodes
+                             if is_power_node(mother)), 0.0)
+                rows += [("Grid in", format_power(grid), TEXT_STRONG),
+                         ("Boost", f"+{format_power(grid * boost * machine_nb)}&nbsp; "
+                                   f"<span style='color:{TEXT_MUTED}'>{boost * 100:.0f}% each</span>",
+                          POWER_MADE_COLOR)]
             # what it swings between, under what it draws on average
             ends = node_power_range(node, values)
             if ends is not None:
@@ -6478,8 +6756,19 @@ def make_node_info_panel(parent):
                                                                   for e in node.recipe.ingredients])))
             body_layout.addWidget(flow_rows("Out", product_rows(node, [(e["item"], e["amount"] * crafts)
                                                                        for e in node.recipe.products])))
+        elif isinstance(node, search.Consumer_Node):
+            count = values["machine_nb"]
+            rows = [("Building", f"{html.escape(node.building.display_name)}&nbsp; <b>× {machine_count(count)}</b>"),
+                    ("Each", format_power(node.building.power), TEXT_STRONG),
+                    ("Power", format_power(node.building.power * count), POWER_DRAWN_COLOR)]
+            ends = node_power_range(node, values)
+            if ends is not None:
+                rows.append(("Between", format_power_range(*ends), POWER_DRAWN_COLOR))
+            body_layout.addWidget(stats(rows))
+            body_layout.addWidget(info_label("How many is set on its card: Power, then Consumer, in the panel",
+                                             TEXT_FAINT, NODE_INFO_SMALL_FONT_SIZE, wrap=True))
         else:
-            body_layout.addWidget(stats([("Rate", f"{values['rate']:,.2f} {rate_unit(node.item)}")]))
+            body_layout.addWidget(stats([("Rate", f"{rate_number(values['rate'])} {rate_unit(node.item)}")]))
 
         body_layout.addWidget(make_panel_divider())
         # the power node is the whole factory's tally rather than anything to
@@ -6503,7 +6792,7 @@ def make_node_info_panel(parent):
         inner = NODE_INFO_WIDTH - margins.left() - margins.right()
         content = (body_layout.totalHeightForWidth(inner) if body_layout.hasHeightForWidth()
                    else body_layout.totalSizeHint().height())
-        return margins.top() + margins.bottom() + content
+        return margins.top() + margins.bottom() + NODE_INFO_GRIP_HEIGHT + 4 + content
 
     panel.set_node = set_node
     # the same node again, for when something outside it changed what its rows
@@ -6511,7 +6800,9 @@ def make_node_info_panel(parent):
     panel.refresh = lambda: set_node(*showing) if showing[0] is not None else None
     panel.wanted_height = wanted_height
     panel.on_resize = None
-    panel.on_recipe_pick = None   # (node, recipe), set by whoever can rebuild the tree
+    panel.on_recipe_manage = None # (node, item), opens the item's recipe manager - or shuts it
+    panel.manager_open_for = lambda item: False   # whether that manager stands open, for its button
+    panel.show_manager_open = lambda on: None     # the button saying so, once it is made
     panel.on_complete = None      # (node), the same - ticks it off as built
     panel.product_flows = {}      # {node: {item: where it goes}}, see product_flows
     panel.is_done = lambda node: False
@@ -6545,8 +6836,81 @@ def make_node_info_panel(parent):
     )
 
     layout.addWidget(scroll, 1)
+
+    # taken off its node, it can be shut from itself - the box's caret is no
+    # longer next to it - or snapped back onto it
+    def set_detached(on):
+        grip.close_button.setVisible(on)
+        grip.home_button.setVisible(on)
+
+    grip.close_button.clicked.connect(lambda: panel.on_close() if panel.on_close is not None else None)
+    grip.home_button.clicked.connect(lambda: panel.on_snap_back() if panel.on_snap_back is not None else None)
+    panel.set_detached = set_detached
+    panel.on_close = None       # set by whoever opens it
+    panel.on_snap_back = None   # ...and the same
     panel.hide()
     return panel
+
+# Back into place: an arrow running down into a corner - a panel going back
+# to hang off the box it was dragged away from
+def draw_snap_back(p, c):
+    pen = QPen(c, 1.6)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    p.drawPolyline(QPolygonF([QPointF(3, 7.5), QPointF(3, 13), QPointF(8.5, 13)]))
+    p.drawLine(QPointF(13, 3), QPointF(6, 10))
+    p.drawPolyline(QPolygonF([QPointF(6, 5.5), QPointF(6, 10), QPointF(10.5, 10)]))
+
+# The strip along the top of a floating panel it is taken hold of by, the
+# whole width of it: a few dots in its middle to say so, and at its right a
+# cross - hidden until the panel is shut from there (see set_detached). It
+# lets presses through to the panel, which does the dragging.
+NODE_INFO_GRIP_HEIGHT = 20
+NODE_INFO_GRIP_DOT = 2.2       # each dot's width
+NODE_INFO_GRIP_GAP = 4         # dot to dot
+NODE_INFO_GRIP_COLOR = TEXT_FAINT
+
+class PanelGrip(QWidget):
+    # `grabbable` off: the strip only holds its buttons - no dots, nothing to take hold of
+    def __init__(self, parent=None, grabbable=True):
+        super().__init__(parent)
+        self.grabbable = grabbable
+        self.setFixedHeight(NODE_INFO_GRIP_HEIGHT)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(2)
+        row.addStretch(1)
+        # back onto its box, for a panel dragged off it - hidden until then
+        self.home_button = make_output_icon_button("", size=NODE_INFO_GRIP_HEIGHT)
+        set_drawn_symbol(self.home_button, draw_snap_back, NODE_INFO_GRIP_HEIGHT - 4)
+        self.home_button.setToolTip("Snap back to its box")
+        self.home_button.hide()
+        row.addWidget(self.home_button)
+        self.close_button = make_remove_output_button()
+        self.close_button.setFixedSize(NODE_INFO_GRIP_HEIGHT, NODE_INFO_GRIP_HEIGHT)
+        self.close_button.setToolTip("Close")
+        self.close_button.hide()
+        row.addWidget(self.close_button)
+        if grabbable:
+            self.setToolTip("Drag to move")
+            self.setCursor(Qt.OpenHandCursor)
+
+    def paintEvent(self, event):
+        if not self.grabbable:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(NODE_INFO_GRIP_COLOR))
+        step = NODE_INFO_GRIP_DOT + NODE_INFO_GRIP_GAP
+        left = self.width() / 2 - 2.5 * step + NODE_INFO_GRIP_GAP / 2
+        for row in (-1, 1):
+            y = self.height() / 2 + row * step / 2 - NODE_INFO_GRIP_DOT / 2
+            for column in range(5):
+                painter.drawEllipse(QRectF(left + column * step, y, NODE_INFO_GRIP_DOT, NODE_INFO_GRIP_DOT))
+        painter.end()
 
 def snap_to_grid(value):
     return round(value / SNAP_STEP) * SNAP_STEP
@@ -7209,6 +7573,13 @@ def cubic_t_leaving_rect(p0, p1, p2, p3, center, half_width, half_height):
 class ConveyorEdge(QGraphicsPathItem):
     def __init__(self, item_name, rate, belts, legacy_arrow, unit="/min"):
         super().__init__()
+        # A pipe can carry pumps (see PumpItem): the squares on it, and the
+        # one offered under the mouse while it hovers - by whoever lets it,
+        # through `pump_host` (see enable_pumps). Set before anything else:
+        # Qt asks a new item what it is made of straight away.
+        self.pump_items = []
+        self.pump_host = None
+        self.pump_ghost = None
         # below the nodes, so a belt passing over a box runs behind it instead
         # of being drawn across its icon and text
         self.setZValue(CONVEYOR_Z)
@@ -7255,12 +7626,18 @@ class ConveyorEdge(QGraphicsPathItem):
         pen.setCapStyle(Qt.RoundCap)
         self.setPen(pen)
 
-        label_text = f"{item_name}  {rate:.1f} {unit}"
+        label_text = f"{item_name}  {rate_number(rate, 1)} {unit}"
         if belts > 1:
             label_text += f"  ×{belts}"
-        # a child of the line, so it inherits its stacking and passes behind a
-        # box along with the curve it belongs to
-        self.label = SceneText(label_text, self)
+        # An item of its own rather than a child of the line: a child is drawn
+        # with its parent, so every line drawn after this one would run over
+        # its words. Stacked over all the lines instead, under the boxes, it
+        # goes wherever the line goes - into a scene and out of it, shown,
+        # faded - see itemChange. The line lies at the scene's origin, so the
+        # words are placed in the same coordinates either way.
+        self.label = SceneText(label_text)
+        self.label.setZValue(CONVEYOR_LABEL_Z)
+        self.label.setAcceptedMouseButtons(Qt.NoButton)
         self.label.setDefaultTextColor(QColor(CONVEYOR_LABEL_COLOR))
         self.label.setFont(scene_font(self.label.font(), CONVEYOR_LABEL_FONT_SIZE))
         self.label.setTransformOriginPoint(self.label.boundingRect().center())
@@ -7281,10 +7658,93 @@ class ConveyorEdge(QGraphicsPathItem):
             self.arrow.setPen(Qt.NoPen)
             self.arrow.setBrush(QBrush(QColor(NODE_LINE_COLOR)))
 
-    # held to its on-screen minimum width zoomed far out, with room for it
+    # held to its on-screen minimum width zoomed far out, with room for it -
+    # and for the band a pipe taking pumps is hovered over by
     def boundingRect(self):
-        return super().boundingRect().adjusted(-MIN_LINE_BOUNDS_MARGIN, -MIN_LINE_BOUNDS_MARGIN,
-                                               MIN_LINE_BOUNDS_MARGIN, MIN_LINE_BOUNDS_MARGIN)
+        margin = MIN_LINE_BOUNDS_MARGIN
+        if self.pump_host is not None:
+            margin = max(margin, PUMP_HOVER_WIDTH / 2 + 1)
+        return super().boundingRect().adjusted(-margin, -margin, margin, margin)
+
+    # A pipe taking pumps is hovered over along a band round the line, not
+    # over the area its curve happens to close round - what a path item is
+    # made of otherwise
+    def shape(self):
+        if self.pump_host is None:
+            return super().shape()
+        band = QPainterPathStroker()
+        band.setWidth(PUMP_HOVER_WIDTH)
+        band.setCapStyle(Qt.RoundCap)
+        return band.createStroke(self.path())
+
+    # its pumps ride the line wherever it is drawn
+    def setPath(self, path):
+        super().setPath(path)
+        for pump in self.pump_items:
+            pump.follow()
+
+    # Lets it take pumps: `host` adds one (host.add(place)), and its pumps
+    # change through it too (see PumpItem). None: they show, nothing changes.
+    def enable_pumps(self, host):
+        self.prepareGeometryChange()
+        self.pump_host = host
+        self.setAcceptHoverEvents(host is not None)
+
+    def pump_place_at(self, point):
+        return nearest_place(self.path(), point)
+
+    # the place under the mouse, unless a pump already stands there: that one
+    # answers for itself
+    def offered_place(self, point):
+        place = self.pump_place_at(point)
+        spot = self.path().pointAtPercent(place)
+        for pump in self.pump_items:
+            if QLineF(pump.pos(), spot).length() < PUMP_SIZE * 1.1:
+                return None
+        return place
+
+    def hoverMoveEvent(self, event):
+        if self.pump_host is None or panel_options["locked"]:
+            self.hide_ghost()
+            return
+        place = self.offered_place(event.scenePos())
+        if place is None:
+            self.hide_ghost()
+            return
+        if self.pump_ghost is None:
+            self.pump_ghost = PumpItem(self, None, place, ghost=True)
+            if self.scene() is not None:
+                self.scene().addItem(self.pump_ghost)
+        self.pump_ghost.place = place
+        self.pump_ghost.follow()
+        self.pump_ghost.show()
+        self.setCursor(Qt.PointingHandCursor)
+
+    def hoverLeaveEvent(self, event):
+        self.hide_ghost()
+
+    def hide_ghost(self):
+        if self.pump_ghost is not None:
+            self.pump_ghost.hide()
+        self.unsetCursor()
+
+    # a click where one is offered puts it there; anywhere else it is the map's
+    def mousePressEvent(self, event):
+        if (self.pump_host is not None and event.button() == Qt.LeftButton
+                and self.pump_ghost is not None and self.pump_ghost.isVisible()):
+            event.accept()
+            return
+        event.ignore()
+
+    def mouseReleaseEvent(self, event):
+        if (self.pump_host is not None and event.button() == Qt.LeftButton
+                and self.pump_ghost is not None and self.pump_ghost.isVisible()):
+            place = self.pump_ghost.place
+            self.hide_ghost()
+            self.pump_host.add(place)
+            event.accept()
+            return
+        event.ignore()
 
     def paint(self, painter, option, widget=None):
         view = painting_view(widget)
@@ -7371,7 +7831,39 @@ class ConveyorEdge(QGraphicsPathItem):
 
     def apply_label_dim(self, value):
         self.label_dim = float(value)
-        self.label.setOpacity(1.0 - (1.0 - CONVEYOR_LABEL_DIM_OPACITY) * self.label_dim)
+        self.sync_label_opacity()
+
+    # the words as faded as the line is, and dimmed on top of that
+    def sync_label_opacity(self):
+        dim = 1.0 - (1.0 - CONVEYOR_LABEL_DIM_OPACITY) * getattr(self, "label_dim", 0.0)
+        self.label.setOpacity(self.opacity() * dim)
+
+    # the words follow the line they belong to: into its scene and out, shown
+    # or hidden, faded, and raised over the other words while it is picked out
+    def itemChange(self, change, value):
+        label = getattr(self, "label", None)
+        if label is not None:
+            try:
+                riders = [label] + list(getattr(self, "pump_items", ()))
+                ghost = getattr(self, "pump_ghost", None)
+                if change == QGraphicsItem.ItemSceneHasChanged:
+                    for rider in riders + ([ghost] if ghost is not None else []):
+                        if rider.scene() is not None and rider.scene() is not value:
+                            rider.scene().removeItem(rider)
+                        if value is not None and rider.scene() is not value:
+                            value.addItem(rider)
+                elif change == QGraphicsItem.ItemVisibleHasChanged:
+                    for rider in riders:
+                        rider.setVisible(bool(value))
+                elif change == QGraphicsItem.ItemOpacityHasChanged:
+                    self.sync_label_opacity()
+                    for pump in riders[1:]:
+                        pump.setOpacity(self.opacity())
+                elif change == QGraphicsItem.ItemZValueHasChanged:
+                    label.setZValue(CONVEYOR_LIVE_LABEL_Z if self.zValue() > CONVEYOR_Z else CONVEYOR_LABEL_Z)
+            except RuntimeError:
+                pass   # a scene gone while the app closes
+        return super().itemChange(change, value)
 
     def apply_highlight(self):
         # up over the other lines while it is picked out, back down after -
@@ -7519,8 +8011,13 @@ class ConveyorEdge(QGraphicsPathItem):
     # rather than turned along the line: a vertical label reads badly, and there
     # is room to the side of a gap that is only a line wide.
     def set_stacked(self):
-        path = QPainterPath(self.start)
-        path.lineTo(self.end)
+        # Both ends run on into their boxes, as a side line's do (see
+        # set_endpoints): a line is drawn under the boxes, so its round cap
+        # ends up hidden under the box and the arrow there, and the line comes
+        # out from under the arrow's tip instead of capping it with a bulge.
+        down = 1 if self.end.y() >= self.start.y() else -1
+        path = QPainterPath(QPointF(self.start.x(), self.start.y() - down * CONVEYOR_NODE_OVERLAP))
+        path.lineTo(QPointF(self.end.x(), self.end.y() + down * CONVEYOR_NODE_OVERLAP))
         self.setPath(path)
 
         # upright beside the run, so what it has to fit in is the clear air
@@ -7609,6 +8106,315 @@ class ConveyorEdge(QGraphicsPathItem):
 # so a swap can be eased from the old port to the new one rather than the line
 # jumping across the border. `slot` is None in "old" arrow mode, where a line
 # runs to the box's plain center and there are no ports at all.
+# The place along `path` nearest `point`, as the share of its length that far
+# along - kept off its ends, which run into the boxes
+def nearest_place(path, point, samples=96):
+    best, best_gap = 0.5, float("inf")
+    for index in range(samples + 1):
+        place = index / samples
+        gap = QLineF(path.pointAtPercent(place), point).length()
+        if gap < best_gap:
+            best, best_gap = place, gap
+    # and closer, between the two samples either side of it
+    low, high = max(0.0, best - 1 / samples), min(1.0, best + 1 / samples)
+    for index in range(17):
+        place = low + (high - low) * index / 16
+        gap = QLineF(path.pointAtPercent(place), point).length()
+        if gap < best_gap:
+            best, best_gap = place, gap
+    return min(max(best, PUMP_END_MARGIN), 1 - PUMP_END_MARGIN)
+
+# A pipeline pump on a pipe: a small square riding the line at its `place` -
+# the share of the line's length it stands along - the pump drawn in it, and
+# a Mk.2 marked by its number in the corner. What it draws goes to the power
+# node with the rest (see extra_draw). It is the line's own: it moves, shows
+# and fades with it. A click opens what can be done with it - the other mark,
+# or taking it off - and it is dragged along its line to another place. A
+# `ghost` is the one offered under the mouse on a pipe, faded, not placed yet.
+class PumpItem(QGraphicsItem):
+    def __init__(self, edge, building, place, index=None, ghost=False, count=1):
+        super().__init__()
+        self.edge = edge
+        self.building = building
+        self.place = place
+        self.index = index        # which of its line's pumps it is
+        self.count = count        # how many pumps stand at this spot
+        self.ghost = ghost
+        self.power_line = None    # its line up to the power node, when the map draws power
+        self.on_moved = None      # what lays that line again when it moves
+        self.hovered = False
+        self.press = None
+        self.dragging = False
+        self.box = QRectF(-PUMP_SIZE / 2, -PUMP_SIZE / 2, PUMP_SIZE, PUMP_SIZE)
+        self.setZValue(PUMP_Z)
+        if ghost:
+            self.setOpacity(PUMP_GHOST_OPACITY)
+            self.setAcceptedMouseButtons(Qt.NoButton)
+            self.setAcceptHoverEvents(False)
+        else:
+            self.setAcceptHoverEvents(True)
+            self.setCursor(Qt.PointingHandCursor)
+            self.setToolTip(f"{building.display_name} \u00d7 {count} - draws {format_power(building.power * count)}\n"
+                            "Click for its settings - drag it along its pipe")
+        self.follow()
+
+    def boundingRect(self):
+        return self.box.adjusted(-3, -3, 3, 3)
+
+    def follow(self):
+        self.setPos(self.edge.path().pointAtPercent(self.place))
+        if self.on_moved is not None:
+            self.on_moved()   # its power line, after it
+
+    # put down just now: it grows out of a dot to its size, overshooting a hair
+    def pop_in(self):
+        self.setTransformOriginPoint(0, 0)
+        self.setScale(0.2)
+        grow = QVariantAnimation()
+        grow.setDuration(PUMP_POP_MS)
+        grow.setStartValue(0.2)
+        grow.setEndValue(1.0)
+        grow.setEasingCurve(QEasingCurve.OutBack)
+
+        def step(value):
+            try:
+                self.setScale(float(value))
+            except RuntimeError:
+                grow.stop()   # its scene drawn over meanwhile
+
+        grow.valueChanged.connect(step)
+        self.pop = grow   # kept alive while it runs
+        grow.start()
+
+    # where its power line comes out of it: the middle of its top
+    def power_top(self):
+        return QPointF(self.pos().x(), self.pos().y() - PUMP_SIZE / 2)
+
+    def hoverEnterEvent(self, event):
+        self.hovered = True
+        self.edge.hide_ghost()
+        self.update()
+
+    def hoverLeaveEvent(self, event):
+        self.hovered = False
+        self.update()
+
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(QPainter.Antialiasing)
+        lit = self.hovered or self.dragging
+        painter.setPen(QPen(QColor(PUMP_PICTURE_COLOR), 2.5))
+        painter.setBrush(QColor(PUMP_HOVER_BG if lit else PUMP_BG))
+        painter.drawRoundedRect(self.box, 6, 6)
+        inner = self.box.adjusted(5, 5, -5, -5)
+        painter.save()
+        painter.translate(inner.topLeft())
+        painter.scale(inner.width() / SYMBOL_CANVAS, inner.height() / SYMBOL_CANVAS)
+        if self.ghost:
+            # what a click would put here: a plus, in the pump's square
+            pen = QPen(QColor(PUMP_PICTURE_COLOR), 2)
+            pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen)
+            painter.drawLine(QPointF(8, 3.5), QPointF(8, 12.5))
+            painter.drawLine(QPointF(3.5, 8), QPointF(12.5, 8))
+        else:
+            draw_pump(painter, QColor(TEXT_STRONG if lit else PUMP_PICTURE_COLOR))
+        painter.restore()
+        if self.ghost:
+            return
+        font = scene_font(painter.font(), 12)
+        font.setBold(True)
+        painter.setFont(font)
+        # a Mk.2 says so in its top corner
+        if self.building is not search.pump_buildings()[0]:
+            mark = self.building.display_name.rsplit(".", 1)[-1]
+            badge = QRectF(self.box.right() - 13, self.box.top() - 5, 18, 18)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(PUMP_PICTURE_COLOR))
+            painter.drawEllipse(badge)
+            painter.setPen(QColor(PUMP_BG))
+            painter.drawText(badge, Qt.AlignCenter, mark)
+        # several at the one spot: how many, under it
+        if self.count > 1:
+            label = f"\u00d7{self.count}"
+            width = QFontMetricsF(font).horizontalAdvance(label) + 10
+            badge = QRectF(-width / 2, self.box.bottom() - 4, width, 17)
+            painter.setPen(QPen(QColor(PUMP_PICTURE_COLOR), 1.5))
+            painter.setBrush(QColor(PUMP_BG))
+            painter.drawRoundedRect(badge, 8, 8)
+            painter.setPen(QColor(TEXT_STRONG))
+            painter.drawText(badge, Qt.AlignCenter, label)
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            event.ignore()
+            return
+        self.press = event.scenePos()
+        self.dragging = False
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        host = self.edge.pump_host
+        if self.press is None or host is None or panel_options["locked"]:
+            return
+        if not self.dragging and QLineF(self.press, event.scenePos()).length() < PUMP_SIZE / 3:
+            return
+        self.dragging = True
+        self.setCursor(Qt.ClosedHandCursor)
+        self.place = self.edge.pump_place_at(event.scenePos())
+        self.follow()
+
+    def mouseReleaseEvent(self, event):
+        host = self.edge.pump_host
+        was_dragging, self.press, self.dragging = self.dragging, None, False
+        self.setCursor(Qt.PointingHandCursor)
+        if host is None or panel_options["locked"]:
+            return
+        if was_dragging:
+            host.move(self.index, self.place)
+            return
+        PumpSettings(host, self.index, self.building, self.count).open_at(event.screenPos())
+
+# A pump's settings, opened by a click on it: which mark - each with what it
+# draws - how many stand at that spot, what they draw together, and taking
+# them off. A popup: it closes on a click anywhere else or Escape, and every
+# change made in it shows on the map at once, the popup staying open.
+PUMP_SETTINGS_WIDTH = 236
+
+class PumpSettings(QFrame):
+    def __init__(self, host, index, building, count):
+        super().__init__(None, Qt.Popup | Qt.FramelessWindowHint)
+        self.host, self.index = host, index
+        self.building, self.count = building, count
+        self.setObjectName("pump_settings")
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.setFixedWidth(PUMP_SETTINGS_WIDTH)
+        self.setStyleSheet(
+            "QFrame#pump_settings {"
+            f"  background: {DIALOG_BG}; border: 1px solid {OUTPUT_FIELD_BORDER};"
+            f"  border-radius: {HOVER_BORDER_RADIUS + 2}px;"
+            "}"
+            f"QLabel {{ background: transparent; color: {TEXT_NORMAL}; font-size: {OUTPUT_RECIPE_FONT_SIZE}px; }}"
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 12)
+        layout.setSpacing(8)
+
+        heading = QHBoxLayout()
+        icon = picture_label(PUMP_PICTURE, 26)
+        title = QLabel("<b>Pipeline pump</b>")
+        title.setStyleSheet(f"color: {TEXT_STRONG}; font-size: {PANEL_FONT_SIZE}px; background: transparent;")
+        close = make_remove_output_button()
+        close.setToolTip("Close")
+        close.clicked.connect(self.close)
+        heading.addWidget(icon)
+        heading.addWidget(title, 1)
+        heading.addWidget(close, 0, Qt.AlignTop)
+        layout.addLayout(heading)
+
+        # the marks, side by side: the one it is lit
+        marks = QHBoxLayout()
+        marks.setSpacing(6)
+        self.mark_buttons = {}
+        for kind in search.pump_buildings():
+            button = QPushButton(f"{kind.display_name.rsplit(' ', 1)[-1]}\n{format_power(kind.power)}")
+            button.setCursor(Qt.PointingHandCursor)
+            button.setFocusPolicy(Qt.NoFocus)
+            button.setFixedHeight(44)
+            button.clicked.connect(lambda _=False, kind=kind: self.pick(kind))
+            marks.addWidget(button, 1)
+            self.mark_buttons[kind] = button
+        layout.addLayout(marks)
+
+        # how many stand there: one fewer, the count, one more
+        number = QHBoxLayout()
+        number.setSpacing(4)
+        caption = QLabel("Number")
+        caption.setStyleSheet(f"color: {TEXT_MUTED}; font-size: {OUTPUT_RECIPE_FONT_SIZE}px; background: transparent;")
+        number.addWidget(caption, 1)
+        fewer = make_output_icon_button(STEP_LEFT_LABEL, OUTPUT_STEP_FONT_SIZE, OUTPUT_STEP_WIDTH)
+        fewer.setToolTip("One fewer")
+        fewer.clicked.connect(lambda: self.set_count(self.count - 1))
+        self.count_label = QLabel()
+        self.count_label.setAlignment(Qt.AlignCenter)
+        self.count_label.setFixedWidth(34)
+        more = make_output_icon_button(STEP_RIGHT_LABEL, OUTPUT_STEP_FONT_SIZE, OUTPUT_STEP_WIDTH)
+        more.setToolTip("One more")
+        more.clicked.connect(lambda: self.set_count(self.count + 1))
+        number.addWidget(fewer)
+        number.addWidget(self.count_label)
+        number.addWidget(more)
+        layout.addLayout(number)
+
+        self.total = QLabel()
+        layout.addWidget(self.total)
+
+        remove = QPushButton("Remove")
+        remove.setCursor(Qt.PointingHandCursor)
+        remove.setFocusPolicy(Qt.NoFocus)
+        remove.setStyleSheet(
+            "QPushButton {"
+            "  background: transparent;"
+            f"  color: {TEXT_MUTED}; border: 1px solid {OUTPUT_FIELD_BORDER};"
+            f"  border-radius: {HOVER_BORDER_RADIUS}px; padding: 6px; font-size: {OUTPUT_RECIPE_FONT_SIZE}px;"
+            "}"
+            f"QPushButton:hover {{ color: {TEXT_STRONG}; border-color: {CONSUMER_PICTURE_COLOR};"
+            f" background: {TAB_SYMBOL_HOVER_BG}; }}"
+        )
+        remove.clicked.connect(self.remove)
+        layout.addWidget(remove)
+        self.show_state()
+
+    def show_state(self):
+        for kind, button in self.mark_buttons.items():
+            lit = kind is self.building
+            button.setStyleSheet(
+                "QPushButton {"
+                f"  background: {SELECTION_BG if lit else 'transparent'};"
+                f"  color: {TAB_SELECTED_COLOR if lit else TEXT_MUTED};"
+                f"  border: 1px solid {PUMP_PICTURE_COLOR if lit else OUTPUT_FIELD_BORDER};"
+                f"  border-radius: {HOVER_BORDER_RADIUS}px; font-size: {OUTPUT_RECIPE_FONT_SIZE}px;"
+                + ("  font-weight: bold;" if lit else "") +
+                "}"
+                f"QPushButton:hover {{ border-color: {PUMP_PICTURE_COLOR}; color: {TAB_SELECTED_COLOR}; }}"
+            )
+        self.count_label.setText(f"<b>{self.count}</b>")
+        self.total.setText(f"<span style='color:{TEXT_MUTED}'>Draws&nbsp;</span>"
+                           f"<b style='color:{CONSUMER_PICTURE_COLOR}'>{format_power(self.building.power * self.count)}</b>")
+
+    def pick(self, kind):
+        if kind is not self.building:
+            self.building = kind
+            self.show_state()
+            self.host.set_kind(self.index, kind)
+
+    def set_count(self, count):
+        count = max(1, count)
+        if count != self.count:
+            self.count = count
+            self.show_state()
+            self.host.set_count(self.index, count)
+
+    def remove(self):
+        self.close()
+        self.host.remove(self.index)
+
+    # just by the pump clicked, kept on the screen
+    def open_at(self, at):
+        self.adjustSize()
+        screen = QApplication.screenAt(at) or QApplication.primaryScreen()
+        room = screen.availableGeometry()
+        x = min(max(room.left(), at.x() + 12), room.right() - self.width())
+        y = min(max(room.top(), at.y() - 20), room.bottom() - self.height())
+        self.move(x, y)
+        # a popup is a window of its own: it fades in through its own opacity
+        self.setWindowOpacity(0.0)
+        self.show()
+        fade = QPropertyAnimation(self, b"windowOpacity", self)
+        fade.setDuration(PUMP_SETTINGS_FADE_MS)
+        fade.setStartValue(0.0)
+        fade.setEndValue(1.0)
+        run(fade)
+
 class PortEnd:
     __slots__ = ("edge", "role", "slot", "target", "count", "flow", "slide", "arrow", "stack")
 
@@ -7637,6 +8443,7 @@ class PortEnd:
 # ground showed through as a thin dark seam between them. The box itself
 # paints only its ground; this paints what it says about its border.
 NODE_OUTLINE_Z = 1   # over the box's own arrows, words and pictures
+NODE_CAPTION_Z = 2   # the machine and its count under the box: over its arrows too
 
 class NodeOutline(QGraphicsItem):
     def __init__(self, box):
@@ -7972,9 +8779,12 @@ class NodeItem(QGraphicsRectItem):
 # drag, and it takes the press itself - a press that reached the box under it
 # would start dragging the node instead of working the button.
 class NodeInfoButton(QGraphicsItem):
-    def __init__(self, side, color, on_click, parent=None):
+    # `side` is the square taking the click; `caret_height` the chevron drawn
+    # in its middle, tip to tip
+    def __init__(self, side, color, on_click, parent=None, caret_height=NODE_INFO_CARET_HEIGHT):
         super().__init__(parent)
         self.box = QRectF(0, 0, side, side)
+        self.caret_height = caret_height
         self.color = QColor(color)   # its node's own, worn while the panel is open
         self.on_click = on_click
         self.open = False
@@ -8042,7 +8852,12 @@ class NodeInfoButton(QGraphicsItem):
             radius = self.box.width() / 4
             painter.drawRoundedRect(self.box, radius, radius)
         painter.save()
-        painter.scale(self.box.width() / SYMBOL_CANVAS, self.box.height() / SYMBOL_CANVAS)
+        # the chevron at its own size in the square's middle - its 9 units of
+        # height on the 16 unit square it is drawn on, `caret_height` long
+        unit = self.caret_height / 9
+        painter.translate(self.box.center())
+        painter.scale(unit, unit)
+        painter.translate(-SYMBOL_CANVAS / 2, -SYMBOL_CANVAS / 2)
         draw_caret(painter, color, self.angle)
         painter.restore()
 
@@ -8064,6 +8879,8 @@ def is_generator(node):
 def node_border_color(node):
     if is_power_node(node) or is_generator(node):
         return POWER_COLOR
+    if isinstance(node, search.Consumer_Node):
+        return CONSUMER_PICTURE_COLOR   # only drawing power: in the red of power drawn
     if node.merged_into is not None:
         return NODE_MERGING_BORDER_COLOR
     if isinstance(node, Output_Node):
@@ -8078,11 +8895,15 @@ def node_border_color(node):
 
 # a build from the outputs as they stand, laid out from scratch: the same
 # outputs always come out the same graph, however they were added to the panel
-def generate_node_graph(view, output, step=0):
+# `extra`, when given, hands over what draws power from outside the tree for
+# the steps just built (see extra_draw), put on them before they are laid out
+def generate_node_graph(view, output, step=0, extra=None, consumers=None):
     # an ore's extraction runs in the miner the options pick
     set_miner_mark(panel_options["miners_mark"])
     steps = Node.get_nodes_from_outputs(output, panel_options["recipe_choices"],
-                                        panel_options["node_recipe_choices"])
+                                        panel_options["node_recipe_choices"], consumers=consumers)
+    if extra is not None:
+        apply_extra(steps, extra(steps))
     layout_nodes(steps)
     view.laid_compact = panel_options["compact"]   # the spacing its boxes stand at
     view.build_steps = steps
@@ -8212,6 +9033,9 @@ def render_node_graph(view, frame):
     # where each box's products go, as its info panel lists them: read
     # before any output is taken out of the step
     item_flows = product_flows(frame)
+    # what the project's augmenters add, against the grid it is on now
+    apply_boost(next((node for node in frame["nodes"] if is_power_node(node)), None),
+                getattr(view, "project_page", None))
     # outputs as outlines: their boxes and every line to them left out, and an
     # item a box made only for them no longer keeps a port on its border
     accents, only_hidden = {}, set()
@@ -8258,6 +9082,7 @@ def render_node_graph(view, frame):
     old_panel = getattr(view, "info_panel", None)
     if old_panel is not None:
         old_panel.deleteLater()
+    view.info_closing = None   # one drawing back goes with its scene
     view.view_changed_callbacks.clear()
 
     scene = QGraphicsScene()
@@ -8272,19 +9097,13 @@ def render_node_graph(view, frame):
     info_open = [False]    # whether that node's info panel is standing open
     items_by_node = {}
     # a recipe picked in the panel goes to whoever rebuilds the tree
-    if getattr(view, "on_node_recipe", None) is not None:
-        info_panel.on_recipe_pick = view.on_node_recipe
+    if getattr(view, "on_node_recipe_manage", None) is not None:
+        info_panel.on_recipe_manage = view.on_node_recipe_manage
+        info_panel.manager_open_for = view.manager_open_for
 
-    def position_info_panel(item):
+    # where the panel hangs off `item`, at the height it has now
+    def spot_by(item):
         viewport = view.viewport()
-        # it grows with its content but never past the view it floats over -
-        # what does not fit scrolls inside the panel instead of off screen.
-        # The height is measured rather than left to adjustSize: a word wrapped
-        # label's size hint is the height of its text unwrapped, which comes
-        # up short and left the panel scrolling with room to spare.
-        wanted = info_panel.wanted_height()
-        room = max(NODE_INFO_MIN_HEIGHT, viewport.height() - 2 * NODE_INFO_MARGIN)
-        info_panel.setFixedHeight(min(wanted, room))
         # anchored to the node's own top right corner, not a fixed view corner
         top_right = view.mapFromScene(item.mapToScene(item.rect().topRight()))
         x = top_right.x() + NODE_INFO_GAP
@@ -8296,14 +9115,118 @@ def render_node_graph(view, frame):
         x = max(NODE_INFO_MARGIN, min(x, viewport.width() - info_panel.width() - NODE_INFO_MARGIN))
         y = max(NODE_INFO_MARGIN, min(top_right.y(),
                                       viewport.height() - info_panel.height() - NODE_INFO_MARGIN))
-        info_panel.move(x, y)
+        return QPoint(round(x), round(y))
+
+    # It grows with its content but never past the view it floats over -
+    # what does not fit scrolls inside the panel instead of off screen.
+    # The height is measured rather than left to adjustSize: a word wrapped
+    # label's size hint is the height of its text unwrapped, which comes
+    # up short and left the panel scrolling with room to spare.
+    def fit_info_height():
+        viewport = view.viewport()
+        wanted = info_panel.wanted_height()
+        room = max(NODE_INFO_MIN_HEIGHT, viewport.height() - 2 * NODE_INFO_MARGIN)
+        info_panel.setFixedHeight(min(wanted, room))
+
+    def position_info_panel(item):
+        fit_info_height()
+        info_panel.move(spot_by(item))
         info_panel.raise_()
+        # the recipe manager opened from it stands beside it
+        follower = getattr(view, "on_info_panel_moved", None)
+        if follower is not None:
+            follower()
 
     # re-anchors the open node's panel whenever the view itself moves, so it
     # stays glued to its node instead of drifting off as you pan/zoom
+    # - unless it was dragged off its node: it then stays where it was put
     def reposition_info():
-        if info_open[0] and open_node[0] is not None:
+        if info_open[0] and open_node[0] is not None and not info_dragged[0]:
             position_info_panel(items_by_node[open_node[0]])
+
+    # The panel can be taken hold of anywhere nothing else takes the press -
+    # its ground, its words - and put down anywhere over the map. It stays
+    # there, no longer hanging off its node as the map moves under it, until
+    # it is opened on another node. The recipe manager bolted to it goes too.
+    info_dragged = [False]
+
+    def move_info(spot):
+        viewport = view.viewport()
+        x = max(NODE_INFO_MARGIN, min(spot.x(), viewport.width() - info_panel.width() - NODE_INFO_MARGIN))
+        y = max(NODE_INFO_MARGIN, min(spot.y(), viewport.height() - info_panel.height() - NODE_INFO_MARGIN))
+        info_panel.move(x, y)
+        follower = getattr(view, "on_info_panel_moved", None)
+        if follower is not None:
+            follower()
+
+    # by `delta`, the manager's own drag included: whether there was a panel to move
+    def drag_info_by(delta):
+        if not info_open[0] or info_panel.isHidden():
+            return False
+        info_dragged[0] = True
+        info_panel.set_detached(True)   # off its node: its own cross shuts it
+        move_info(info_panel.pos() + delta)
+        return True
+
+    class InfoDrag(QObject):
+        def __init__(self, parent):
+            super().__init__(parent)
+            self.press = None
+
+        def eventFilter(self, watched, event):
+            kind = event.type()
+            if (kind == QEvent.MouseButtonPress and event.button() == Qt.LeftButton
+                    and info_panel.in_grab_area(event.globalPosition().toPoint())):
+                self.press = event.globalPosition().toPoint()
+                QApplication.setOverrideCursor(Qt.ClosedHandCursor)
+                return True
+            if kind == QEvent.MouseMove and self.press is not None:
+                at = event.globalPosition().toPoint()
+                drag_info_by(at - self.press)
+                self.press = at
+                return True
+            if kind == QEvent.MouseButtonRelease and self.press is not None:
+                self.press = None
+                QApplication.restoreOverrideCursor()
+                drop_info()
+                return True
+            return False
+
+    # Back onto its box: it glides from where it was put to where it hangs
+    # off the box, the recipe manager along with it, and follows the box
+    # again from then on - from its button, or let go close to that spot.
+    def snap_info_back():
+        node = open_node[0]
+        if not info_open[0] or node not in items_by_node:
+            return
+        info_dragged[0] = False
+        info_panel.set_detached(False)
+        follower = getattr(view, "on_info_panel_moved", None)
+        glide = QPropertyAnimation(info_panel, b"pos", info_panel)
+        glide.setDuration(INFO_SNAP_MS)
+        glide.setEasingCurve(QEasingCurve.OutCubic)
+        glide.setStartValue(info_panel.pos())
+        glide.setEndValue(spot_by(items_by_node[node]))
+        if follower is not None:
+            glide.valueChanged.connect(lambda _: follower())
+        # the box may have moved under it on the way: it lands where it hangs now
+        glide.finished.connect(reposition_info)
+        run(glide)
+
+    def drop_info():
+        node = open_node[0]
+        if not info_dragged[0] or not info_open[0] or node not in items_by_node:
+            return
+        home = spot_by(items_by_node[node])
+        if (info_panel.pos() - home).manhattanLength() <= INFO_SNAP_DISTANCE:
+            snap_info_back()
+
+    info_panel.drag = InfoDrag(info_panel)
+    info_panel.installEventFilter(info_panel.drag)
+    info_panel.on_close = lambda: close_info()
+    info_panel.on_snap_back = snap_info_back
+    view.drop_info = drop_info
+    view.drag_info_by = drag_info_by
 
     # the lines into and out of one node, for picking its own supply out of
     # the rest of the map while its panel is open
@@ -8350,8 +9273,64 @@ def render_node_graph(view, frame):
         if not info_open[0]:
             return
         info_open[0] = False
-        fade_out(info_panel)
+        # with the recipe manager out, the two go together: slid back toward
+        # the box as they fade, the manager bolted on all the way - rather
+        # than the manager left folding up on its own where the panel was
+        if getattr(view, "manager_is_out", lambda: False)() and open_node[0] in items_by_node:
+            retract_info()
+        else:
+            fade_out(info_panel)
         refresh_info_buttons()
+        closed = getattr(view, "on_info_closed", None)   # the manager bolted to it shuts with it
+        if closed is not None:
+            closed()
+
+    # The panel drawn back toward its box: a short slide that way - left, for
+    # a panel standing on the box's right - fading out as it goes. Meanwhile
+    # it stays what the manager is bolted to (view.info_closing), shut or not.
+    retracting = [None]
+
+    def retract_info():
+        box = items_by_node[open_node[0]]
+        middle = view.mapFromScene(box.mapToScene(box.rect().center())).x()
+        toward = -1 if middle < info_panel.x() + info_panel.width() / 2 else 1
+        start = info_panel.pos()
+        end = start + QPoint(toward * INFO_RETRACT, 0)
+        effect = QGraphicsOpacityEffect(info_panel)
+        info_panel.setGraphicsEffect(effect)
+        view.info_closing = info_panel
+        motion = QVariantAnimation(info_panel)
+        motion.setDuration(INFO_RETRACT_MS)
+        motion.setStartValue(0.0)
+        motion.setEndValue(1.0)
+        motion.setEasingCurve(QEasingCurve.InCubic)
+
+        def step(t):
+            info_panel.move(round(start.x() + (end.x() - start.x()) * t), start.y())
+            effect.setOpacity(1.0 - t)
+            follow_info()
+
+        def finished():
+            if retracting[0] is not motion:
+                return
+            retracting[0] = None
+            view.info_closing = None
+            info_panel.setGraphicsEffect(None)
+            info_panel.hide()
+            follow_info()
+
+        motion.valueChanged.connect(step)
+        motion.finished.connect(finished)
+        retracting[0] = motion
+        motion.start(QAbstractAnimation.DeleteWhenStopped)
+
+    # opened again while it was being drawn back: it stays, whole
+    def stop_retract():
+        motion, retracting[0] = retracting[0], None
+        if motion is not None:
+            motion.stop()
+            view.info_closing = None
+            info_panel.setGraphicsEffect(None)
 
     # a click on the box itself: it picks the node out and nothing more -
     # clicking the picked one again puts it back. The panel is the caret's.
@@ -8364,9 +9343,15 @@ def render_node_graph(view, frame):
         if info_open[0] and open_node[0] is node:
             close_info()
             return   # the node stays picked out; only its panel goes
+        stop_retract()
         moving_over = info_open[0]
+        info_dragged[0] = False    # opened on a node: it hangs off that node again
+        info_panel.set_detached(False)
         set_picked(node)
         info_open[0] = True
+        opened = getattr(view, "on_info_opened", None)   # the manager keeps to it, or shuts
+        if opened is not None:
+            opened(node)
         info_panel.set_node(node, recorded[node])
         position_info_panel(item)
         refresh_info_buttons()
@@ -8374,6 +9359,44 @@ def render_node_graph(view, frame):
             pulse(info_panel)      # moved over to another node: its new content flashes in
         else:
             fade_in(info_panel)
+        follow_info()   # showing now: the recipe manager's tab comes out by it
+
+    # Opened on `node` from outside - after a rebuild, on the node it stood
+    # open on before - at `spot` when it had been dragged there, without any
+    # fade: it is the same panel, only read again. Whether `node` is on the map.
+    def open_info_on(node, spot=None):
+        item = items_by_node.get(node)
+        if item is None or node not in recorded:
+            return False
+        stop_retract()
+        set_picked(node)
+        info_open[0] = True
+        info_panel.set_node(node, recorded[node])
+        position_info_panel(item)
+        info_panel.set_detached(spot is not None)
+        if spot is not None:
+            info_dragged[0] = True
+            move_info(spot)
+        refresh_info_buttons()
+        info_panel.show()
+        info_panel.raise_()
+        follow_info()
+        return True
+
+    # whatever stands by the panel - the recipe manager and its tab - laid
+    # out against it as it now is
+    def follow_info():
+        follower = getattr(view, "on_info_panel_moved", None)
+        if follower is not None:
+            follower()
+
+    view.open_node_info = open_info_on
+    view.info_node = lambda: open_node[0] if info_open[0] else None
+    view.info_was_dragged = lambda: info_dragged[0]
+    # A scene drawn over the last throws its info panel away, open or not,
+    # with nothing shutting it: whatever stood by it - the recipe manager's
+    # tab - is laid out again against this scene's, still shut.
+    follow_info()
 
     view.view_changed_callbacks.append(reposition_info)
 
@@ -8385,7 +9408,18 @@ def render_node_graph(view, frame):
                 item.refresh_glow()
 
     view.view_changed_callbacks.append(hold_glows)
-    info_panel.on_resize = reposition_info   # More info opened or shut
+    # More info opened or shut: as tall as what it now says - hung off its
+    # box again, or, dragged away from it, left where it was put
+    def resize_info():
+        if not info_open[0] or open_node[0] not in items_by_node:
+            return
+        if not info_dragged[0]:
+            reposition_info()
+            return
+        fit_info_height()
+        move_info(info_panel.pos())   # kept inside the view, the manager following
+
+    info_panel.on_resize = resize_info
 
     recorded = frame["values"]
     focus = frame.get("focus")
@@ -8436,6 +9470,9 @@ def render_node_graph(view, frame):
             line.set_ends(QPointF(box.pos().x() + power_arrow_x(line.feeding, box.rect().width()),
                                   box.pos().y()), rail,
                           feed[line.feeding])
+        for pump, line in pump_lines:
+            line.rail_y_wanted = rail
+            line.set_ends(pump.power_top(), rail, feed[False], tuck=PUMP_LINE_TUCK)
 
     def node_moved(moved=None):
         # a transition drops the whole scene while its boxes are still gliding,
@@ -8450,6 +9487,7 @@ def render_node_graph(view, frame):
             pass
 
     power_line_of = {}
+    pump_lines = []    # (pump, its power line) - see the pumps below
     for node in nodes:
         # the power node is drawn its own way - a box at the top of the map
         # every machine's line runs up to - but answers a click like any
@@ -8504,11 +9542,14 @@ def render_node_graph(view, frame):
         # panel is shut until it is pressed (see toggle_info). A compact box
         # carries a smaller one - it is all the box says, and the panel is the
         # only place the numbers are left to read
-        caret = NODE_INFO_COMPACT_BUTTON_SIZE if panel_options["compact"] else NODE_INFO_BUTTON_SIZE
+        compact = panel_options["compact"]
+        caret = NODE_INFO_COMPACT_BUTTON_SIZE if compact else NODE_INFO_BUTTON_SIZE
         info_button = NodeInfoButton(caret, border_color,
-                                     lambda n=node, i=item: toggle_info(n, i), item)
-        info_button.setPos(node_width() - NODE_INFO_BUTTON_MARGIN - caret,
-                           NODE_INFO_BUTTON_MARGIN if panel_options["compact"] else NODE_INFO_BUTTON_TOP)
+                                     lambda n=node, i=item: toggle_info(n, i), item,
+                                     NODE_INFO_COMPACT_CARET_HEIGHT if compact else NODE_INFO_CARET_HEIGHT)
+        # its square as far from the box's right border as from its top
+        info_button.setPos(*caret_spot(node_width(), caret,
+                                       NODE_INFO_COMPACT_BUTTON_MARGIN if compact else NODE_INFO_BUTTON_MARGIN))
         item.info_button = info_button
         item.texts.append(info_button)
 
@@ -8675,7 +9716,7 @@ def render_node_graph(view, frame):
         text.setDefaultTextColor(QColor(NODE_TEXT_COLOR))
         name_width = (node_width() - NODE_INFO_BUTTON_MARGIN - NODE_INFO_BUTTON_SIZE
                       - NODE_INFO_BUTTON_GAP - text_x)
-        caret_middle = NODE_INFO_BUTTON_TOP + NODE_INFO_BUTTON_SIZE / 2
+        caret_middle = NODE_INFO_BUTTON_MARGIN + NODE_INFO_BUTTON_SIZE / 2
 
         def name_start(font):
             metrics = QFontMetricsF(font)
@@ -8705,6 +9746,9 @@ def render_node_graph(view, frame):
             fit_one_line(under, node_width(), float("inf"), NODE_CAPTION_FONT_SIZE)
             under.setTextWidth(node_width())
             under.setPos(0, NODE_HEIGHT + NODE_CAPTION_GAP)
+            # over the arrows hanging off the box's bottom border, which are
+            # made after it and would otherwise be drawn across its words
+            under.setZValue(NODE_CAPTION_Z)
             item.texts.append(under)
 
         items_by_node[node] = item
@@ -8936,6 +9980,7 @@ def render_node_graph(view, frame):
             # when the pair is dragged past each other.
             edge = ConveyorEdge(flow_item.display_name, rate, lines_needed(flow_item, rate),
                                 legacy_arrows, rate_unit(flow_item))
+            edge.flow_item = flow_item
             edge.stacked = True
             scene.addItem(edge)
             taking = PortEnd(edge, "start", None, None, flow_item,
@@ -8973,6 +10018,7 @@ def render_node_graph(view, frame):
             legacy_arrows,
             rate_unit(flow_item),
         )
+        edge.flow_item = flow_item
         scene.addItem(edge)
         if mother is node:
             edge.loop_item = item   # its own output coming back in
@@ -8988,6 +10034,84 @@ def render_node_graph(view, frame):
                                   port_arrow(item, "out", exit_index)))
         edge_items[(mother, node)] = edge
         edge_rates[(mother, node)] = rate
+
+    # Every pipe takes pumps (see PumpItem): those this project keeps on it,
+    # by the boxes at its two ends and what it carries, put back on it - and
+    # while the graph is not locked, more added to it, changed and moved, the
+    # power node told after each change (view.on_pumps_changed)
+    pumps = getattr(view, "pumps", None)
+    if pumps is None:
+        pumps = view.pumps = {}
+    pump_kinds = {building.full_name: building for building in search.pump_buildings()}
+
+    class PumpHost:
+        def __init__(self, key):
+            self.key = key
+
+        def placed(self):
+            return pumps.setdefault(self.key, [])
+
+        def changed(self):
+            if not pumps.get(self.key):
+                pumps.pop(self.key, None)
+            follower = getattr(view, "on_pumps_changed", None)
+            if follower is not None:
+                follower()
+
+        def add(self, place):
+            pump = [place, default_pump().full_name, 1]
+            self.placed().append(pump)
+            self.placed().sort(key=lambda placed: placed[0])
+            view.pump_landing = (self.key, self.placed().index(pump))
+            self.changed()
+
+        def set_kind(self, index, building):
+            self.placed()[index][1] = building.full_name
+            self.changed()
+
+        def set_count(self, index, count):
+            pump = self.placed()[index]
+            pump[2:] = [max(1, int(count))]
+            self.changed()
+
+        def remove(self, index):
+            del self.placed()[index]
+            self.changed()
+
+        def move(self, index, place):
+            self.placed()[index][0] = place
+            self.placed().sort(key=lambda pump: pump[0])
+            self.changed()
+
+    if pump_kinds:
+        for (mother, daughter), edge in edge_items.items():
+            flow_item = getattr(edge, "flow_item", None)
+            if flow_item is None or not getattr(flow_item, "is_fluid", False):
+                continue
+            key = (node_key(mother), node_key(daughter), flow_item.full_name)
+            edge.enable_pumps(None if panel_options["locked"] else PumpHost(key))
+            for index, placed in enumerate(pumps.get(key, ())):
+                building = pump_kinds.get(placed[1])
+                if building is None:
+                    continue
+                pump = PumpItem(edge, building, placed[0], index, count=pump_count(placed))
+                edge.pump_items.append(pump)
+                scene.addItem(pump)
+                # its own line up to the power node, as a machine drawing power has
+                if power_item[0] is not None:
+                    line = PowerEdge(pump.power_top(), rail_y, power_item[0].feed_point(False), feeding=False)
+                    line.set_ends(pump.power_top(), rail_y, power_item[0].feed_point(False), tuck=PUMP_LINE_TUCK)
+                    scene.addItem(line)
+                    power_lines.append(line)
+                    pump.power_line = line
+                    pump_lines.append((pump, line))
+                    pump.on_moved = lambda pump=pump, line=line: line.set_ends(
+                        pump.power_top(), line.rail_y_wanted, power_item[0].feed_point(False), tuck=PUMP_LINE_TUCK)
+                    # the one just put there pops in
+                    if getattr(view, "pump_landing", None) == (key, index):
+                        view.pump_landing = None
+                        pump.pop_in()
+                    line.rail_y_wanted = rail_y
 
     # the power node's own pair, side by side under it: the right one pointing
     # up into the box for the power arriving from the generators, the left one
@@ -9551,10 +10675,19 @@ def fit_view_to_rect(view, rect, animate=False):
 PANEL_WIDTH = 350
 PANEL_BG = "#2a2a2a"
 PANEL_SECTIONS = ("Output", "Option")
-PANEL_TAB_LABELS = ("Output", "Generator")   # the two lists the section holds
-PANEL_TAB_SIDES = ("output", "generator")
-PANEL_TAB_ACCENTS = ("blue", "yellow")   # the accent each side puts the app in
+PANEL_TAB_SIDES = ("output", "generator", "consumer")
+PANEL_TAB_ACCENTS = ("blue", "yellow", "red")   # the accent each side puts the app in
+SIDE_ACCENTS = dict(zip(PANEL_TAB_SIDES, PANEL_TAB_ACCENTS))
+# The lists as the panel offers them: Output and Power over everything, and
+# under Power - only while it is open - which of its two lists, Generator or Consumer
+PANEL_TOP_LABELS = ("Output", "Power")
+PANEL_TOP_ACCENTS = ("blue", ("yellow", "red"))   # Power counts its generators and its consumers apart
+POWER_LIST_LABELS = ("Generator", "Consumer")
+POWER_LIST_SIDES = ("generator", "consumer")
+POWER_LIST_ACCENTS = ("yellow", "red")
+POWER_LIST_GAP = 4   # between the two rows of tabs: the second hangs just under the first
 TAB_BADGE_SIZE = 18            # the little count in a tab's corner
+TAB_BADGE_GAP = 3              # between two counts on one tab
 TAB_BADGE_FONT_SIZE = 13       # as big as the circle comfortably holds
 TAB_BADGE_MARGIN = 3
 TAB_BADGE_BG = "#5a5a5a"       # a strip of tabs with no accents of its own
@@ -9576,6 +10709,8 @@ PANEL_SCROLLBAR_COLOR = "#4a4a4a"
 PANEL_SCROLLBAR_HOVER_COLOR = "#5e5e5e"
 ADD_OUTPUT_LABEL = "Add Output"
 ADD_GENERATOR_LABEL = "Add Generator"
+ADD_CONSUMER_LABEL = "Add Consumer"
+CONSUMER_COUNT_UNIT = "buildings"   # what a consumer card's number counts
 ADD_OUTPUT_HOVER_BG = "#2f88c4"  # accent, darkened for hover
 CONFIRM_LABEL = "Confirm"
 # what the panel's own button says, from what pressing it would do: draw the
@@ -9647,6 +10782,15 @@ RECIPE_FIELD_HOVER_BORDER = "rgba(255, 255, 255, 0.22)"
 OUTPUT_FIELD_BORDER = "#444"
 MENU_BG = "#252525"
 MENU_ITEM_PADDING = "8px 12px"
+RECIPE_ROW_CHANGE_LABEL = "Change"  # the two buttons on a row of a recipe list:
+RECIPE_ROW_ADD_LABEL = "Add"        # run it instead, or run it beside - each after its symbol
+RECIPE_ROW_SYMBOL_SIZE = 11         # the drawn swap arrows and plus
+RECIPE_ROW_SYMBOL_GAP = 6           # from the symbol to the word
+RECIPE_ROW_BUTTON_HEIGHT = 28
+RECIPE_ROW_BUTTON_PAD = 12          # the words from a button's sides
+RECIPE_ROW_BUTTON_GAP = 6           # between the two, and after the name
+RECIPE_ROW_BUTTON_FONT_SIZE = 13
+RECIPE_PART_RATE_WIDTH = 64          # an output card's field for one of its recipes' share
 
 STEP_AMOUNT = 1
 OUTPUT_REMOVE_SIZE = 26
@@ -9793,6 +10937,145 @@ def track_field_state(field, combo, *parts):
     for widget in (field, window) + parts:
         widget.installEventFilter(field.tracker)
 
+# The rows of a recipe list that can run a recipe beside the one picked, not
+# only in its place: two small buttons at each row's right end - Change, the
+# row's recipe instead of the one running (what a click anywhere else on the
+# row does too), and Add, the row's recipe as well. The row of the recipe
+# running has neither, and a recipe already running beside it cannot be
+# added again (`blocked`).
+class RecipeRowDelegate(QStyledItemDelegate):
+    def __init__(self, combo):
+        super().__init__(combo)
+        self.combo = combo
+        self.hover = None        # (row, "change" | "add") under the mouse
+        self.blocked = set()     # recipes whose Add is greyed out
+        font = QFont(combo.font())
+        font.setPixelSize(RECIPE_ROW_BUTTON_FONT_SIZE)
+        self.font = font
+        metrics = QFontMetrics(font)
+        self.labels = {"change": RECIPE_ROW_CHANGE_LABEL, "add": RECIPE_ROW_ADD_LABEL}
+        self.widths = {kind: metrics.horizontalAdvance(label) + RECIPE_ROW_SYMBOL_SIZE + RECIPE_ROW_SYMBOL_GAP
+                       + 2 * RECIPE_ROW_BUTTON_PAD for kind, label in self.labels.items()}
+        self.room = self.widths["change"] + self.widths["add"] + 3 * RECIPE_ROW_BUTTON_GAP + LIST_ROW_INSET
+
+    def has_buttons(self, index):
+        return index.row() != self.combo.currentIndex() and bool(index.flags() & Qt.ItemIsEnabled)
+
+    # where the two stand on a row's rectangle: {"change": QRect, "add": QRect}
+    def button_rects(self, rect):
+        top = rect.center().y() - RECIPE_ROW_BUTTON_HEIGHT // 2 + 1
+        right = rect.right() - RECIPE_ROW_BUTTON_GAP - LIST_ROW_INSET
+        add = QRect(right - self.widths["add"], top, self.widths["add"], RECIPE_ROW_BUTTON_HEIGHT)
+        change = QRect(add.left() - RECIPE_ROW_BUTTON_GAP - self.widths["change"], top,
+                       self.widths["change"], RECIPE_ROW_BUTTON_HEIGHT)
+        return {"change": change, "add": add}
+
+    # which button of which row is at `point` of the list: (row, kind) or None
+    def button_at(self, view, point):
+        index = view.indexAt(point)
+        if not index.isValid() or not self.has_buttons(index):
+            return None
+        for kind, rect in self.button_rects(view.visualRect(index)).items():
+            if rect.contains(point):
+                return index.row(), kind
+        return None
+
+    def sizeHint(self, option, index):
+        size = super().sizeHint(option, index)
+        # tall enough for the buttons, with a little air over and under them
+        return QSize(size.width() + self.room,
+                     max(size.height(), RECIPE_ROW_BUTTON_HEIGHT + 2 * LIST_ROW_INSET + 8))
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        if not self.has_buttons(index):
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setFont(self.font)
+        for kind, rect in self.button_rects(option.rect).items():
+            blocked = kind == "add" and index.data(Qt.UserRole) in self.blocked
+            lit = not blocked and self.hover == (index.row(), kind)
+            painter.setPen(QPen(QColor(TEXT_MUTED if lit else OUTPUT_FIELD_BORDER), 1))
+            painter.setBrush(QColor(TAB_SYMBOL_PRESS_BG) if lit else Qt.NoBrush)
+            painter.drawRoundedRect(QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5),
+                                    HOVER_BORDER_RADIUS, HOVER_BORDER_RADIUS)
+            color = QColor(TEXT_DISABLED if blocked else TAB_SELECTED_COLOR if lit else TEXT_MUTED)
+            # the symbol, then the word after it
+            side = RECIPE_ROW_SYMBOL_SIZE
+            symbol = QRectF(rect.left() + RECIPE_ROW_BUTTON_PAD, rect.center().y() - side / 2 + 0.5, side, side)
+            self.draw_symbol(painter, kind, symbol, color)
+            painter.setPen(color)
+            words = QRect(rect.left() + RECIPE_ROW_BUTTON_PAD + side + RECIPE_ROW_SYMBOL_GAP, rect.top(),
+                          rect.width(), rect.height())
+            painter.drawText(words, Qt.AlignLeft | Qt.AlignVCenter, self.labels[kind])
+        painter.restore()
+
+    # Change: two arrows, one over the other, pointing opposite ways - one
+    # recipe out, the other in. Add: a plus.
+    @staticmethod
+    def draw_symbol(painter, kind, box, color):
+        pen = QPen(color, 1.4)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        left, right, top, bottom = box.left(), box.right(), box.top(), box.bottom()
+        if kind == "add":
+            middle_x, middle_y = box.center().x(), box.center().y()
+            painter.drawLine(QPointF(middle_x, top), QPointF(middle_x, bottom))
+            painter.drawLine(QPointF(left, middle_y), QPointF(right, middle_y))
+            return
+        head = box.width() * 0.3
+        upper, lower = top + box.height() * 0.28, top + box.height() * 0.72
+        painter.drawLine(QPointF(left, upper), QPointF(right, upper))
+        painter.drawPolyline(QPolygonF([QPointF(right - head, upper - head), QPointF(right, upper),
+                                        QPointF(right - head, upper + head)]))
+        painter.drawLine(QPointF(left, lower), QPointF(right, lower))
+        painter.drawPolyline(QPolygonF([QPointF(left + head, lower - head), QPointF(left, lower),
+                                        QPointF(left + head, lower + head)]))
+
+# The clicks on those buttons, heard on the list before the combo's own popup
+# does: it would take any release on a row as that row picked, and close.
+class RecipeRowClicks(QObject):
+    def __init__(self, combo, delegate, on_add):
+        super().__init__(combo)
+        self.combo = combo
+        self.delegate = delegate
+        self.on_add = on_add
+
+    def eventFilter(self, watched, event):
+        try:
+            view = self.combo.view()
+            kind = event.type()
+            if kind in (QEvent.MouseMove, QEvent.Leave):
+                hover = None if kind == QEvent.Leave else self.delegate.button_at(view, event.position().toPoint())
+                if hover != self.delegate.hover:
+                    self.delegate.hover = hover
+                    watched.update()
+                return False
+            if kind not in (QEvent.MouseButtonPress, QEvent.MouseButtonDblClick, QEvent.MouseButtonRelease):
+                return False
+            hit = self.delegate.button_at(view, event.position().toPoint())
+            if hit is None or event.button() != Qt.LeftButton:
+                return False
+            if kind != QEvent.MouseButtonRelease:
+                return True   # the press stays on the button, not the row
+            row, which = hit
+            recipe = self.combo.itemData(row)
+            if which == "add" and recipe in self.delegate.blocked:
+                return True
+            self.delegate.hover = None
+            self.combo.hidePopup()
+            if which == "change":
+                self.combo.setCurrentIndex(row)
+            else:
+                # once the list has closed: what it opens takes the focus
+                QTimer.singleShot(0, lambda: self.on_add(recipe))
+            return True
+        except RuntimeError:
+            return False   # a list gone while the app closes
+
 # the recipe an output is made with, picked among every recipe its item has -
 # the item's first, its default, to start with. A borderless combo with a drawn
 # arrow, as the option rows below use (a styled QComboBox loses its native
@@ -9805,8 +11088,11 @@ def track_field_state(field, combo, *parts):
 # greys out the recipes other outputs of the same item already run, so they
 # cannot be picked here; `on_change` is called whenever the pick changes.
 # `options`, when given, is the list of recipes to choose from instead of the
-# item's own - a node supplying several items answers for all of them
-def make_recipe_dropdown(item, recipe=None, on_change=None, options=None):
+# item's own - a node supplying several items answers for all of them.
+# `on_add`, when given, puts the Change and Add buttons on the list's rows
+# (see RecipeRowDelegate) and is called with the recipe an Add asks for;
+# field.set_add_blocked(recipes) greys out the Add of the recipes running already.
+def make_recipe_dropdown(item, recipe=None, on_change=None, options=None, on_add=None):
     field = QWidget()
     field.setObjectName("recipe_field")
     field.setFixedHeight(OUTPUT_RECIPE_HEIGHT)
@@ -9839,8 +11125,10 @@ def make_recipe_dropdown(item, recipe=None, on_change=None, options=None):
 
     combo = ignore_closed_wheel(QComboBox())
     combo.setObjectName("recipe_combo")
-    # rows painted from the stylesheet (rounded highlight) rather than as menu rows
-    combo.setItemDelegate(QStyledItemDelegate(combo))
+    # rows painted from the stylesheet (rounded highlight) rather than as menu
+    # rows - with the Change and Add buttons on them, when it can add
+    delegate = RecipeRowDelegate(combo) if on_add is not None else QStyledItemDelegate(combo)
+    combo.setItemDelegate(delegate)
     options = list(options if options is not None else item.recipes)
     for option in options:
         combo.addItem(option.display_name, option)
@@ -9896,6 +11184,11 @@ def make_recipe_dropdown(item, recipe=None, on_change=None, options=None):
     )
     view = combo.view()
     view.setMinimumWidth(view.sizeHintForColumn(0) + 2 * view.frameWidth() + 24)
+    if on_add is not None:
+        # heard before the popup's own filter, which was put on first
+        view.setMouseTracking(True)
+        combo.row_clicks = RecipeRowClicks(combo, delegate, on_add)
+        view.viewport().installEventFilter(combo.row_clicks)
 
     # the whole rest of its line, its arrow at the card's right edge; a name
     # too long for that is cut rather than pushing the line past the card
@@ -9941,11 +11234,65 @@ def make_recipe_dropdown(item, recipe=None, on_change=None, options=None):
             row_item.setEnabled(not used)
             row_item.setToolTip(SEARCH_TAKEN_TOOLTIP if used else "")
 
+    def set_add_blocked(recipes):
+        if isinstance(delegate, RecipeRowDelegate):
+            delegate.blocked = set(recipes)
+
     field_layout.addWidget(combo, 1)
     field_layout.addWidget(arrow)
     field.combo = combo
     field.set_used = set_used
+    field.set_add_blocked = set_add_blocked
     return field, lambda: combo.currentData()
+
+# ---- rates typed as sums ----
+#
+# A rate field takes a little arithmetic as well as a number - "30*2",
+# "120/3", "45+12.5", "(60-15)/2" - and works it out once the field is left
+# or Enter is pressed. Only figures, a dot, + - * / and brackets go in.
+# Nothing in it is ever run as code: it is read into a tree of numbers and
+# those four operations, and anything else - a sum not finished yet, a
+# division by nothing, a rate below nothing - is no rate at all.
+RATE_SUM_MAX_LENGTH = 48
+RATE_SUM_PATTERN = r"[0-9.+\-*/() ]*"
+RATE_SUM_HINT = "A sum works too - 30*2, 120/3, 45+12.5"
+_RATE_OPERATIONS = {ast.Add: operator.add, ast.Sub: operator.sub,
+                    ast.Mult: operator.mul, ast.Div: operator.truediv}
+
+def rate_validator(field):
+    field.setMaxLength(RATE_SUM_MAX_LENGTH)
+    return QRegularExpressionValidator(QRegularExpression(RATE_SUM_PATTERN), field)
+
+# what `text` comes to, rounded the way the fields show it - or None when it
+# is not a rate (an empty field is nothing, 0)
+def evaluate_rate(text):
+    text = text.strip()
+    if not text:
+        return 0.0
+    try:
+        tree = ast.parse(text, mode="eval")
+    except (SyntaxError, ValueError):
+        return None
+
+    def worked_out(node):
+        if isinstance(node, ast.Expression):
+            return worked_out(node.body)
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+            return float(node.value)
+        if isinstance(node, ast.BinOp) and type(node.op) in _RATE_OPERATIONS:
+            return _RATE_OPERATIONS[type(node.op)](worked_out(node.left), worked_out(node.right))
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            value = worked_out(node.operand)
+            return -value if isinstance(node.op, ast.USub) else value
+        raise ValueError("not a sum of numbers")
+
+    try:
+        value = worked_out(tree)
+    except (ValueError, ZeroDivisionError, OverflowError, RecursionError):
+        return None
+    if not math.isfinite(value) or value < 0 or value >= 10 ** OUTPUT_RATE_MAX_DIGITS:
+        return None
+    return round(value, OUTPUT_RATE_MAX_DECIMALS)
 
 # an output, as a card read top to bottom - what it is, how it is made, how
 # much of it: its name with the remove button, the recipe it is made with,
@@ -9968,7 +11315,12 @@ def one_machine_rate(item, recipe):
         duration = durations.get(miner, duration)
     return round(product["amount"] / duration * 60, OUTPUT_RATE_MAX_DECIMALS)
 
-def make_output_row(item, recipe=None, on_recipe_change=None, start=None, on_rate_change=None):
+# `shares`, when given, is the recipes the card runs together and what each
+# makes ([(Recipe, rate)]) - `recipe` and `start` are then the first's and the sum.
+# row.get_parts() hands them back, row.add_line(recipe) adds one at nothing,
+# and row.change_part(was, recipe) switches one the way the Recipes page does.
+def make_output_row(item, recipe=None, on_recipe_change=None, start=None, on_rate_change=None,
+                    shares=None):
     row = QWidget()
     row.setObjectName("output_card")
     row.setAttribute(Qt.WA_StyledBackground, True)
@@ -10001,7 +11353,7 @@ def make_output_row(item, recipe=None, on_recipe_change=None, start=None, on_rat
     # the whole of what the card says.
     def card_picture(recipe):
         if item is POWER_ITEM and recipe is not None:
-            return picture_or_missing(recipe.machine[0].picture)
+            return machine_picture(recipe.machine[0])
         return item_picture(item)
 
     picture = picture_label(card_picture(recipe), OUTPUT_PICTURE_SIZE)
@@ -10019,34 +11371,257 @@ def make_output_row(item, recipe=None, on_recipe_change=None, start=None, on_rat
     header_layout.addStretch(1)
     header_layout.addWidget(remove_button)
 
-    # how it is made: a quiet label, then the recipe it can be switched to
-    recipe_line = QHBoxLayout()
-    recipe_line.setContentsMargins(0, 0, 0, 0)
-    recipe_line.setSpacing(OUTPUT_RECIPE_GAP)
-    recipe_title = QLabel("Recipe:")
-    recipe_title.setStyleSheet(f"color: {OUTPUT_CAPTION_COLOR}; font-size: {OUTPUT_RECIPE_FONT_SIZE}px;")
-    # switching a generator card to another fuel switches its building too
-    def recipe_picked():
-        fresh = picture_label(card_picture(get_recipe()), OUTPUT_PICTURE_SIZE)
-        picture.setPixmap(fresh.pixmap())
-        picture.setAlignment(Qt.AlignCenter)
-        # a rate still at the old recipe's one machine follows the new one's;
-        # one the user set stays as they set it
-        new_default = one_machine_rate(item, get_recipe())
-        if (default[0] is not None and new_default is not None
-                and abs(value[0] - default[0]) <= 10 ** -OUTPUT_RATE_MAX_DECIMALS / 2):
-            value[0] = new_default
-            field.setText(shown(new_default))
-        default[0] = new_default
+    # How it is made, the way the recipe manager says it: a line per recipe -
+    # its color, the recipe its list switches to another (or, its Add, puts
+    # another beside it, at nothing, for its rate to be typed), the rate it
+    # makes and a small cross taking it off. An output is what it is asked to
+    # be, so there is nothing for the recipes to meet: the card's rate is
+    # theirs added up - following each one typed, losing one taken off - and
+    # a rate typed for the card shares itself out among them the way they
+    # stand. With several, the bar under them says how much each makes. Alone,
+    # a recipe makes all of the card's rate, and its line is the plain
+    # dropdown it always was.
+    recipe_lines = QWidget()
+    recipe_lines.setStyleSheet("background: transparent;")
+    recipes_layout = QVBoxLayout(recipe_lines)
+    recipes_layout.setContentsMargins(0, 0, 0, 0)
+    recipes_layout.setSpacing(6)
+    lines_holder = QWidget()
+    lines_layout = QVBoxLayout(lines_holder)
+    lines_layout.setContentsMargins(0, 0, 0, 0)
+    lines_layout.setSpacing(4)
+    recipes_layout.addWidget(lines_holder)
+    # [{"get_recipe", "field", "line", "title", "swatch", "share", "remove", "rate"}], the first the card's own
+    parts = []
+    others_used = []   # what the other cards of the item run, as the panel last said
+    # power is made by one generator per card: it is never shared
+    can_add = item is not POWER_ITEM
+
+
+    # how much each makes of the card's rate, while there are several
+    share_bar = RecipeShareBar()
+    recipes_layout.addWidget(share_bar)
+
+    def part_recipes(excluding=None):
+        return [part["get_recipe"]() for part in parts if part is not excluding]
+
+    def refresh_used():
+        for part in parts:
+            part["field"].set_used(others_used + part_recipes(excluding=part))
+            part["field"].set_add_blocked(others_used + part_recipes())
+
+    def set_used(recipes):
+        others_used[:] = recipes
+        refresh_used()
+        show_status()
+
+    row.set_used = set_used
+
+    def changed():
+        refresh_used()
         set_tip()
         if on_recipe_change is not None:
             on_recipe_change()
 
-    recipe_field, get_recipe = make_recipe_dropdown(item, recipe, recipe_picked)
-    row.set_used = recipe_field.set_used
-    row.combo = recipe_field.combo
-    recipe_line.addWidget(recipe_title)
-    recipe_line.addWidget(recipe_field, 1)
+    def color_of(index):
+        return RECIPE_MANAGER_COLORS[index % len(RECIPE_MANAGER_COLORS)]
+
+    def assigned():
+        return sum(part["rate"] for part in parts)
+
+    # the card's rate taken from its recipes', after one of them changed
+    def follow_parts():
+        value[0] = assigned()
+        field.setText(shown(value[0]))
+
+    def unused():
+        listed = others_used + part_recipes()
+        return [recipe for recipe in item.recipes if recipe not in listed]
+
+    # the bar, read off the rates typed
+    def show_status():
+        if not parts:
+            return
+        several = len(parts) > 1
+        share_bar.setVisible(several)
+        if several:
+            share_bar.set_shares([(color_of(index), part["rate"]) for index, part in enumerate(parts)],
+                                 assigned(), False)
+
+    # each line as it has to look for how many there are: alone, the plain
+    # dropdown; several, each with its color, its rate and its cross
+    def show_parts():
+        several = len(parts) > 1
+        for index, part in enumerate(parts):
+            part["swatch"].color = color_of(index)
+            part["swatch"].setVisible(several)
+            part["swatch"].update()
+            part["share"].setVisible(several)
+            part["remove"].setVisible(several)
+            if not part["share"].hasFocus():
+                part["share"].setText(shown(part["rate"]))
+        field.setText(shown(value[0]))
+        show_status()
+
+    # The card's rate set: one recipe makes all of it, several keep their
+    # shares of it - still adding up to it, if they did
+    def set_total(rate):
+        old, value[0] = value[0], rate
+        if len(parts) == 1:
+            parts[0]["rate"] = rate
+        else:
+            for part in parts:
+                part["rate"] = (part["rate"] * rate / old) if old > 1e-9 else rate / len(parts)
+        show_parts()
+        if "show_boost" in row.__dict__:
+            row.show_boost()   # more augmenters, more boost
+
+    def make_part(recipe, rate):
+        part = {"rate": rate}
+        line = QWidget()
+        line_layout = QHBoxLayout(line)
+        line_layout.setContentsMargins(0, 0, 0, 0)
+        line_layout.setSpacing(OUTPUT_RECIPE_GAP)
+        title = QLabel("Recipe:")
+        title.setStyleSheet(f"color: {OUTPUT_CAPTION_COLOR}; font-size: {OUTPUT_RECIPE_FONT_SIZE}px;")
+        # Only the first line says it: the ones under it line up beneath. All
+        # of them as wide as the word at the size it is drawn - the
+        # stylesheet's, which the label's own font does not know of yet - so
+        # the lines under it start where it does, to the pixel.
+        measure = QFont(title.font())
+        measure.setPixelSize(OUTPUT_RECIPE_FONT_SIZE)
+        title.setFixedWidth(math.ceil(QFontMetricsF(measure).horizontalAdvance("Recipe:")) + 2)
+        if parts:
+            title.setText("")
+        swatch = RecipeDot(color_of(len(parts)))
+        # its list switches it to another recipe, or - Add - puts another on
+        # the card beside it, at nothing, for its rate to be typed
+        part_field, get_part_recipe = make_recipe_dropdown(
+            item, recipe, lambda: recipe_picked(part),
+            on_add=(lambda added: add_line(added)) if can_add else None)
+        share = QLineEdit()
+        share.setFixedSize(RECIPE_PART_RATE_WIDTH, OUTPUT_RECIPE_HEIGHT)
+        share.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        share.setValidator(rate_validator(share))
+        share.setToolTip(f"What this recipe makes, in {rate_unit(item)}\n{RATE_SUM_HINT}")
+        share.setStyleSheet(
+            "QLineEdit {"
+            f"  background-color: {OUTPUT_FIELD_BG};"
+            f"  color: {TAB_SELECTED_COLOR};"
+            f"  border: 1px solid {OUTPUT_FIELD_BORDER};"
+            f"  border-radius: {HOVER_BORDER_RADIUS}px;"
+            f"  font-size: {OUTPUT_RECIPE_FONT_SIZE}px;"
+            "  padding: 0 6px;"
+            "}"
+            f"QLineEdit:focus {{ background-color: {OUTPUT_FIELD_EDITING_BG}; border: 1px solid {TAB_INDICATOR_COLOR}; }}"
+            f"QLineEdit:hover:!focus {{ border: 1px solid {TAB_SYMBOL_COLOR}; }}"
+        )
+
+        # read as it is typed - a sum as soon as it is a whole one (see
+        # evaluate_rate): the other recipes are left as they are, and the
+        # card's rate becomes theirs and this one's together
+        def typing(text):
+            rate = evaluate_rate(text)
+            if rate is None:
+                return   # a sum not finished yet: the last rate stands meanwhile
+            part["rate"] = rate
+            follow_parts()
+            show_status()
+            if on_rate_change is not None:
+                on_rate_change()
+
+        share.textEdited.connect(typing)
+        share.editingFinished.connect(lambda: share.setText(shown(part["rate"])))
+        # a small grey cross, set in from the card's edge: the card's own
+        # bigger cross, over it, takes the whole output off - this only the
+        # one recipe. Held with the room after it, so the two hide together
+        # while the card runs one recipe alone.
+        remove = QWidget()
+        remove_layout = QHBoxLayout(remove)
+        remove_layout.setContentsMargins(0, 0, REMOVE_RECIPE_INSET, 0)
+        remove_layout.setSpacing(0)
+        cross = make_remove_recipe_button(OUTPUT_RECIPE_HEIGHT)
+        cross.setToolTip("Remove this recipe - its rate is left to share out")
+        cross.clicked.connect(lambda: remove_part(part))
+        remove_layout.addWidget(cross)
+        line_layout.addWidget(title)
+        line_layout.addWidget(swatch)
+        line_layout.addWidget(part_field, 1)
+        line_layout.addWidget(share)
+        line_layout.addWidget(remove)
+        part.update(get_recipe=get_part_recipe, field=part_field, line=line, title=title,
+                    swatch=swatch, share=share, remove=remove)
+        lines_layout.addWidget(line)
+        parts.append(part)
+        return part
+
+    # another recipe beside the ones running, making nothing yet: its rate
+    # field ready to type in, the others left as they are
+    def add_line(recipe):
+        if recipe in part_recipes() or recipe in others_used or not can_add:
+            return
+        part = make_part(recipe, 0.0)
+        part["line"].show()   # into a card already on screen: shown by hand
+        show_parts()
+        changed()
+        part["share"].setFocus()
+        part["share"].selectAll()
+
+    def drop_part(part):
+        parts.remove(part)
+        lines_layout.removeWidget(part["line"])
+        part["line"].deleteLater()
+        # the first line left says "Recipe:" again, in the same room
+        parts[0]["title"].setText("Recipe:")
+
+    # One recipe taken off, and what it made with it: the card's rate is
+    # what the others make
+    def remove_part(part):
+        if len(parts) < 2 or part not in parts:
+            return
+        drop_part(part)
+        follow_parts()
+        show_parts()
+        changed()
+
+    # the recipe running `was` switched to `recipe` - from the Recipes page:
+    # taken into the line already running it, when there is one
+    def change_part(was, recipe):
+        part = next((part for part in parts if part["get_recipe"]() is was), None)
+        if part is None or recipe not in item.recipes:
+            return
+        twin = next((other for other in parts if other["get_recipe"]() is recipe), None)
+        if twin is not None:
+            twin["rate"] += part["rate"]
+            drop_part(part)
+            show_parts()
+            changed()
+            return
+        part["field"].combo.setCurrentIndex(item.recipes.index(recipe))
+
+    # switching a generator card to another fuel switches its building too
+    def recipe_picked(part):
+        if part is parts[0]:
+            fresh = picture_label(card_picture(get_recipe()), OUTPUT_PICTURE_SIZE)
+            picture.setPixmap(fresh.pixmap())
+            picture.setAlignment(Qt.AlignCenter)
+        # a rate still at the old recipe's one machine follows the new one's;
+        # one the user set stays as they set it - and one shared between
+        # recipes is the user's too
+        if len(parts) == 1:
+            new_default = one_machine_rate(item, get_recipe())
+            if (default[0] is not None and new_default is not None
+                    and abs(value[0] - default[0]) <= 10 ** -OUTPUT_RATE_MAX_DECIMALS / 2):
+                set_total(new_default)
+            default[0] = new_default
+        show_boost()
+        changed()
+
+    def get_recipe():
+        return parts[0]["get_recipe"]()
+
+    first = make_part(recipe, 0.0)
+    row.combo = first["field"].combo
 
     fluid = getattr(item, "is_fluid", False)
     # a new card starts at what one machine of its recipe makes - megawatts
@@ -10062,11 +11637,11 @@ def make_output_row(item, recipe=None, on_recipe_change=None, start=None, on_rat
 
     field = QLineEdit(shown(start))
     field.setFixedHeight(OUTPUT_PICTURE_SIZE)   # level with the picture beside it
-    # only digits and one dot go in: anything else typed or pasted is simply
-    # not taken. Empty, or a lone dot, stays allowed while typing; commit()
-    # puts the last good value back.
-    field.setValidator(QRegularExpressionValidator(QRegularExpression(
-        rf"\d{{0,{OUTPUT_RATE_MAX_DIGITS}}}(\.\d{{0,{OUTPUT_RATE_MAX_DECIMALS}}})?"), field))
+    # only figures, a dot and a sum's + - * / and brackets go in: anything
+    # else typed or pasted is simply not taken. Whatever is not a rate when
+    # it is committed - a sum left unfinished - gives the last good one back.
+    field.setValidator(rate_validator(field))
+    field.setToolTip(RATE_SUM_HINT)
     field.setStyleSheet(
         "QLineEdit {"
         f"  background-color: {OUTPUT_FIELD_BG};"
@@ -10092,12 +11667,22 @@ def make_output_row(item, recipe=None, on_recipe_change=None, start=None, on_rat
     # the typed text should be taken. Anything that is not a number - an empty
     # field, a lone dot - is thrown away and the last good value comes back.
     value = [start]
+    first["rate"] = start
+    # a card made with several recipes at once gets their lines back, at the
+    # shares they had
+    if shares and len(shares) > 1:
+        value[0] = first["rate"] = 0.0
+        for index, (made, rate) in enumerate(shares):
+            part = first if index == 0 else make_part(made, 0.0)
+            part["rate"] = rate
+            value[0] += rate
+    show_parts()
+    refresh_used()
 
     def commit():
-        try:
-            value[0] = float(field.text().strip())
-        except ValueError:
-            pass
+        rate = evaluate_rate(field.text())   # a sum is worked out (see evaluate_rate)
+        if rate is not None:
+            set_total(rate)
         field.setText(shown(value[0]))
         field.clearFocus()      # Enter ends the edit instead of leaving a caret
         if on_rate_change is not None:
@@ -10107,21 +11692,62 @@ def make_output_row(item, recipe=None, on_recipe_change=None, start=None, on_rat
 
     def step(delta):
         # rounded so 0.1 steps never pile up float dust like 0.30000000000000004
-        value[0] = max(0, round(value[0] + delta, OUTPUT_RATE_MAX_DECIMALS))
-        field.setText(shown(value[0]))
+        set_total(max(0, round(value[0] + delta, OUTPUT_RATE_MAX_DECIMALS)))
         if on_rate_change is not None:
             on_rate_change()
+
+    # An augmenter runs flat out or not at all: its card steps by a whole
+    # building - what one makes - rather than by one megawatt
+    def step_amount():
+        made = get_recipe()
+        if item is POWER_ITEM and getattr(made, "power_boost", 0):
+            return one_machine_rate(item, made) or STEP_AMOUNT
+        return STEP_AMOUNT
 
     # a stepper of two buttons as tall as the field, square to it
     step_left = make_output_icon_button(STEP_LEFT_LABEL, OUTPUT_STEP_FONT_SIZE, OUTPUT_STEP_WIDTH)
     step_left.setFixedHeight(OUTPUT_PICTURE_SIZE)
-    step_left.setToolTip(f"{-STEP_AMOUNT} {rate_unit(item)}")
-    step_left.clicked.connect(lambda: step(-STEP_AMOUNT))
+    step_left.clicked.connect(lambda: step(-step_amount()))
 
     step_right = make_output_icon_button(STEP_RIGHT_LABEL, OUTPUT_STEP_FONT_SIZE, OUTPUT_STEP_WIDTH)
     step_right.setFixedHeight(OUTPUT_PICTURE_SIZE)
-    step_right.setToolTip(f"+{STEP_AMOUNT} {rate_unit(item)}")
-    step_right.clicked.connect(lambda: step(STEP_AMOUNT))
+    step_right.clicked.connect(lambda: step(step_amount()))
+
+    def step_tips():
+        amount = rate_number(step_amount())
+        step_left.setToolTip(f"-{amount} {rate_unit(item)}")
+        step_right.setToolTip(f"+{amount} {rate_unit(item)}")
+
+    step_tips()
+
+    # An augmenter's card says what it does on top of its own power: the
+    # share of the whole grid it adds, the grid's power going into it, and
+    # what that comes to (see show_boost, which the panel calls with the grid)
+    boost_line = QLabel()
+    boost_line.setTextFormat(Qt.RichText)
+    boost_line.setWordWrap(True)
+    boost_line.setStyleSheet(f"font-size: {OUTPUT_RECIPE_FONT_SIZE}px; background: transparent;")
+    boost_line.hide()
+    grid_seen = [0.0]
+
+    def show_boost(grid=None):
+        if grid is not None:
+            grid_seen[0] = grid
+        made = get_recipe()
+        boost = getattr(made, "power_boost", 0) if item is POWER_ITEM else 0
+        boost_line.setVisible(bool(boost) and not row.compact)
+        if not boost:
+            return
+        buildings = value[0] / (one_machine_rate(item, made) or 1)
+        added = boost * buildings * grid_seen[0]
+        boost_line.setText(
+            f"<span style='color:{OUTPUT_CAPTION_COLOR}'>Grid in&nbsp;</span>"
+            f"<b style='color:{TEXT_STRONG}'>{format_power(grid_seen[0])}</b>"
+            f"<span style='color:{OUTPUT_CAPTION_COLOR}'>&nbsp;&nbsp;→&nbsp;&nbsp;{boost * 100:.0f}% each&nbsp;</span>"
+            f"<b style='color:{POWER_MADE_COLOR}'>+{format_power(added)}</b>")
+        step_tips()
+
+    row.show_boost = show_boost
 
     # what the number counts - that much of the item made every minute, in
     # cubic meters for a fluid - written inside the field at its right end,
@@ -10151,11 +11777,12 @@ def make_output_row(item, recipe=None, on_recipe_change=None, start=None, on_rat
     value_row.addWidget(step_right)
 
     row_layout.addWidget(header)
-    row_layout.addLayout(recipe_line)
+    row_layout.addWidget(recipe_lines)
     recipe_gap = QWidget()
     recipe_gap.setFixedHeight(4)
     row_layout.addWidget(recipe_gap)
     row_layout.addLayout(value_row)
+    row_layout.addWidget(boost_line)
 
     # A compact card is a tile: the picture over the rate, nothing else. What
     # it is and how it is made are in its tooltip, and switching back to the
@@ -10163,18 +11790,26 @@ def make_output_row(item, recipe=None, on_recipe_change=None, start=None, on_rat
     row.compact = False
 
     def set_tip():
+        if not row.compact:
+            row.setToolTip("")
+            return
+        if len(parts) > 1:
+            row.setToolTip(item.display_name + "".join(
+                f"\n{part['get_recipe']().display_name} \u2014 {shown(part['rate'])} {rate_unit(item)}"
+                for part in parts))
+            return
         made = get_recipe()
         named = made is not None and made.display_name != item.display_name
-        row.setToolTip(f"{item.display_name}" + (f" \u2014 {made.display_name}" if named else "")
-                       if row.compact else "")
+        row.setToolTip(f"{item.display_name}" + (f" \u2014 {made.display_name}" if named else ""))
 
     def set_compact(on):
         if on == row.compact:
             return
         row.compact = on
-        for widget in (header, recipe_title, recipe_field, recipe_gap, picture_gap,
+        for widget in (header, recipe_lines, recipe_gap, picture_gap,
                        step_gap, step_left, step_right):
             widget.setVisible(not on)
+        show_boost()   # out of a tile, its boost said again
         if on:
             value_row.removeWidget(picture)
             row_layout.insertWidget(0, picture, 0, Qt.AlignHCenter)
@@ -10188,8 +11823,996 @@ def make_output_row(item, recipe=None, on_recipe_change=None, start=None, on_rat
         set_tip()
 
     row.set_compact = set_compact
+    # every recipe the card runs and what each makes: [(Recipe, rate)]
+    row.get_parts = lambda: [(part["get_recipe"](), part["rate"]) for part in parts]
+    row.add_line = add_line
+    row.change_part = change_part
 
     return row, remove_button, lambda: value[0], get_recipe
+
+# A building that only draws power, as a card on the Consumer list: its name
+# and the cross taking it off, then its picture beside how many of them there
+# are - whole buildings, a sum typed worked out and rounded - and under that
+# what one draws and what they all draw. Laid out as an output card is, and
+# as compact: a tile is its picture over its count. Returns what
+# make_output_row does, a consumer having no recipe and asking for nothing
+# but power (row.get_parts is empty: it is no output of the tree).
+def make_consumer_row(building, start=None, on_rate_change=None):
+    row = QWidget()
+    row.setObjectName("output_card")
+    row.setAttribute(Qt.WA_StyledBackground, True)
+    row.setStyleSheet(
+        "QWidget#output_card {"
+        f"  background-color: {OUTPUT_CARD_BG};"
+        f"  border-radius: {HOVER_BORDER_RADIUS + 2}px;"
+        "}"
+        "QWidget#output_card QLabel, QWidget#output_card QWidget#output_header {"
+        "  background: transparent;"
+        "}"
+    )
+    row_layout = QVBoxLayout(row)
+    row_layout.setContentsMargins(OUTPUT_CARD_PADDING, OUTPUT_CARD_PADDING,
+                                  OUTPUT_CARD_PADDING, OUTPUT_CARD_PADDING)
+    row_layout.setSpacing(4)
+
+    header = QWidget()
+    header.setObjectName("output_header")
+    header_layout = QHBoxLayout(header)
+    header_layout.setContentsMargins(0, 0, 0, 0)
+    header_layout.setSpacing(4)
+    label = selectable(QLabel(building.display_name))
+    label.setStyleSheet(f"color: {OUTPUT_NAME_COLOR}; font-size: {PANEL_FONT_SIZE}px; font-weight: bold;")
+    remove_button = make_remove_output_button()
+    remove_button.setToolTip("Remove this consumer")
+    header_layout.addWidget(label)
+    header_layout.addStretch(1)
+    header_layout.addWidget(remove_button)
+
+    picture = picture_label(power_building_picture(building), OUTPUT_PICTURE_SIZE)
+    row.picture = picture
+
+    value = [max(0, round(start if start is not None else 1))]
+
+    def shown(count):
+        return str(int(count))
+
+    field = QLineEdit(shown(value[0]))
+    field.setFixedHeight(OUTPUT_PICTURE_SIZE)
+    field.setValidator(rate_validator(field))
+    field.setToolTip(f"How many - whole buildings. {RATE_SUM_HINT}")
+    field.setStyleSheet(
+        "QLineEdit {"
+        f"  background-color: {OUTPUT_FIELD_BG};"
+        f"  color: {TAB_SELECTED_COLOR};"
+        f"  border: 1px solid {OUTPUT_FIELD_BORDER};"
+        f"  border-radius: {HOVER_BORDER_RADIUS}px;"
+        f"  font-size: {PANEL_FONT_SIZE}px;"
+        f"  padding: 0 {OUTPUT_UNIT_ROOM + 30}px 0 10px;"
+        "}"
+        "QLineEdit:focus {"
+        f"  background-color: {OUTPUT_FIELD_EDITING_BG};"
+        f"  border: 1px solid {TAB_INDICATOR_COLOR};"
+        "}"
+        "QLineEdit:hover:!focus {"
+        f"  border: 1px solid {TAB_SYMBOL_COLOR};"
+        "}"
+    )
+    unit = QLabel(CONSUMER_COUNT_UNIT)
+    unit.setAttribute(Qt.WA_TransparentForMouseEvents)
+    unit.setStyleSheet(f"color: {OUTPUT_CAPTION_COLOR}; font-size: {OUTPUT_RECIPE_FONT_SIZE}px;"
+                       " background: transparent; border: none;")
+    unit_layout = QHBoxLayout(field)
+    unit_layout.setContentsMargins(0, 0, 10, 0)
+    unit_layout.addStretch(1)
+    unit_layout.addWidget(unit)
+
+    # what one draws, and all of them together - the middle of a range for a
+    # building whose draw swings, with the range said beside it
+    draw = QLabel()
+    draw.setTextFormat(Qt.RichText)
+
+    def show_draw():
+        if building.power_max:
+            each = (f"{format_power(building.power_min)} – {format_power(building.power_max)} each, "
+                    f"{format_power(building.power)} on average")
+        else:
+            each = f"{format_power(building.power)} each"
+        draw.setText(f"<span style='color:{OUTPUT_CAPTION_COLOR}'>{each}</span>"
+                     f"<span style='color:{OUTPUT_CAPTION_COLOR}'>&nbsp;&nbsp;·&nbsp;&nbsp;</span>"
+                     f"<b style='color:{CONSUMER_PICTURE_COLOR}'>{format_power(building.power * value[0])}</b>")
+        draw.setStyleSheet(f"font-size: {OUTPUT_RECIPE_FONT_SIZE}px; background: transparent;")
+        field.setText(shown(value[0]))
+        set_tip()
+
+    def set_count(count):
+        value[0] = max(0, int(round(count)))
+        show_draw()
+        if on_rate_change is not None:
+            on_rate_change()
+
+    def commit():
+        count = evaluate_rate(field.text())
+        if count is not None:
+            set_count(count)
+        else:
+            field.setText(shown(value[0]))
+        field.clearFocus()
+
+    field.editingFinished.connect(commit)
+
+    step_left = make_output_icon_button(STEP_LEFT_LABEL, OUTPUT_STEP_FONT_SIZE, OUTPUT_STEP_WIDTH)
+    step_left.setFixedHeight(OUTPUT_PICTURE_SIZE)
+    step_left.setToolTip("One fewer")
+    step_left.clicked.connect(lambda: set_count(value[0] - 1))
+    step_right = make_output_icon_button(STEP_RIGHT_LABEL, OUTPUT_STEP_FONT_SIZE, OUTPUT_STEP_WIDTH)
+    step_right.setFixedHeight(OUTPUT_PICTURE_SIZE)
+    step_right.setToolTip("One more")
+    step_right.clicked.connect(lambda: set_count(value[0] + 1))
+
+    value_row = QHBoxLayout()
+    value_row.setSpacing(2)
+    value_row.addWidget(picture)
+    picture_gap = QWidget()
+    picture_gap.setFixedWidth(OUTPUT_PICTURE_GAP - 2)
+    value_row.addWidget(picture_gap)
+    value_row.addWidget(field, 1)
+    step_gap = QWidget()
+    step_gap.setFixedWidth(4)
+    value_row.addWidget(step_gap)
+    value_row.addWidget(step_left)
+    value_row.addWidget(step_right)
+
+    row_layout.addWidget(header)
+    row_layout.addLayout(value_row)
+    row_layout.addWidget(draw)
+
+    row.compact = False
+
+    def set_tip():
+        row.setToolTip(f"{building.display_name} × {shown(value[0])} — "
+                       f"{format_power(building.power * value[0])}" if row.compact else "")
+
+    def set_compact(on):
+        if on == row.compact:
+            return
+        row.compact = on
+        for widget in (header, draw, picture_gap, step_gap, step_left, step_right):
+            widget.setVisible(not on)
+        if on:
+            value_row.removeWidget(picture)
+            row_layout.insertWidget(0, picture, 0, Qt.AlignHCenter)
+            padding = OUTPUT_TILE_PADDING
+        else:
+            row_layout.removeWidget(picture)
+            value_row.insertWidget(0, picture)
+            padding = OUTPUT_CARD_PADDING
+        row_layout.setContentsMargins(padding, padding, padding, padding)
+        picture.setCursor(Qt.OpenHandCursor if on else Qt.ArrowCursor)
+        set_tip()
+
+    show_draw()
+    row.set_compact = set_compact
+    row.add_one = lambda: set_count(value[0] + 1)
+    row.get_parts = lambda: []      # it asks the tree for nothing
+    row.set_used = lambda recipes: None
+    row.combo = None
+    return row, remove_button, lambda: value[0], lambda: None
+
+# ---- the recipe manager ----
+#
+# How an item is made for the machines inside the tree that take it, in one
+# place: every recipe making it for them, each with the rate it makes. It is
+# the item's, not one box's: every box making that item for those machines
+# opens the same one, bolted to the box's info panel.
+#
+# What is typed in it is a draft, nothing more, until it is applied: a recipe
+# switched for another, a rate typed, a recipe taken off, one added - at
+# nothing, for its rate to be typed after. The rates have to add up to what
+# the machines need, which it says at the top; the bar and the line under it
+# say how far the rates typed are from it - green once they meet it, grey
+# until then - and Apply stays greyed out until they do. Applied, the tree is
+# rebuilt and the manager reads it again, staying open.
+#
+# panel.show_item(item, nodes) opens it on an item of a finished tree,
+# panel.refresh(nodes) reads it again off a new one - the draft starting over
+# from it, and the manager closing if the item no longer goes to any machine
+# - and panel.on_apply(item, split) is handed what is applied, as
+# [(Recipe, share)], to rebuild the tree with.
+RECIPE_MANAGER_WIDTH = 384
+RECIPE_MANAGER_TITLE = "Recipe manager"
+RECIPE_MANAGER_PICTURE_SIZE = 36
+RECIPE_MANAGER_MATCH_COLOR = NODE_OUTPUT_BORDER_COLOR   # the rates meeting what is needed
+RECIPE_MANAGER_RATE_WIDTH = 84
+RECIPE_MANAGER_DOT = 14             # a recipe's color square, left of its line - its color on the bar too
+RECIPE_MANAGER_BAR_HEIGHT = 8
+RECIPE_MANAGER_BAR_BG = "#1b1b1b"
+RECIPE_MANAGER_BUTTON_HEIGHT = 34
+RECIPE_MANAGER_SLIDE = 70           # px it slides out of the info panel's side as it opens, and back in
+RECIPE_MANAGER_SLIDE_MS = 200
+# a color per recipe, in the order they stand: quiet tints that tell lines
+# apart without shouting over the rest of the panel
+RECIPE_MANAGER_COLORS = ["#5dade2", "#c39bd3", "#f0b27a", "#76d7c4", "#f1948a", "#f7dc6f",
+                         "#a9cce3", "#d7bde2", "#a3e4d7", "#fad7a0"]
+
+# The bar under the recipes: each recipe's rate a stretch of it in the
+# recipe's own color, side by side, against the whole of what is needed.
+# Short of it, the rest of the bar stays empty; past it, the bar is rescaled
+# to hold every rate and a tick marks where what is needed ends. Whether
+# they meet it is said by the line under it, not on the bar.
+class RecipeShareBar(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(RECIPE_MANAGER_BAR_HEIGHT + 4)
+        self.parts = []       # [(color, rate)]
+        self.total = 0.0
+        self.matched = False
+
+    def set_shares(self, parts, total, matched):
+        self.parts, self.total, self.matched = parts, total, matched
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        track = QRectF(1, 2, self.width() - 2, RECIPE_MANAGER_BAR_HEIGHT)
+        radius = RECIPE_MANAGER_BAR_HEIGHT / 2
+        outline = QPainterPath()
+        outline.addRoundedRect(track, radius, radius)
+        painter.fillPath(outline, QColor(RECIPE_MANAGER_BAR_BG))
+        assigned = sum(rate for _, rate in self.parts)
+        whole = max(self.total, assigned, 1e-9)
+        painter.save()
+        painter.setClipPath(outline)
+        x = track.left()
+        for color, rate in self.parts:
+            width = track.width() * rate / whole
+            if width > 0:
+                painter.fillRect(QRectF(x, track.top(), width, track.height()), QColor(color))
+                x += width
+        painter.restore()
+        if assigned > self.total + 1e-9 and self.total > 0:
+            # where what is needed ends, over the rates running past it
+            tick = track.left() + track.width() * self.total / whole
+            painter.setPen(QPen(QColor(TEXT_STRONG), 2))
+            painter.drawLine(QPointF(tick, 0), QPointF(tick, self.height()))
+        painter.end()
+
+# The tab the recipe manager is pulled out of the info panel by: only an
+# arrow pointing out sticks out of the panel's side, level with its top, and
+# the manager slides out from behind the panel under it. As it comes, the
+# tab stretches along with it into the manager's own title bar, uncovering
+# "Recipe Manager" by the panel's edge, where the words stay, while the
+# arrow rides the manager's far edge, turning round to point back in - what
+# a click on it does now. `side` is the panel's side it is on ("right", or
+# "left" when the map has no room there); `level` how far out the manager
+# is, from 0 to 1. A click anywhere on it calls `on_click`.
+RECIPE_TAB_LABEL = "Recipe Manager"
+RECIPE_TAB_HEIGHT = 42
+RECIPE_TAB_PAD = 14                  # the words from the panel's edge
+RECIPE_TAB_ARROW = 36                # the arrow's room at the far end
+RECIPE_TAB_ARROW_SCALE = 1.5         # the arrow, drawn this much over its 16 unit square
+RECIPE_TAB_FONT_SIZE = 15
+RECIPE_TAB_CLOSED_PAD = 2            # past it, closed: only the arrow sticks out
+RECIPE_TAB_BG = DIALOG_BG            # the panels' own ground: the manager's title bar is part of it
+RECIPE_TAB_HOVER_BG = "#353535"      # a step lighter under the mouse, to say it can be clicked
+
+class RecipeManagerTab(QWidget):
+    def __init__(self, parent, on_click):
+        super().__init__(parent)
+        self.on_click = on_click
+        self.side = "right"
+        self.level = 0.0
+        self.hovered = False
+        self.pressed = False
+        self.font_used = QFont(self.font())
+        self.font_used.setPixelSize(RECIPE_TAB_FONT_SIZE)
+        self.setFixedHeight(RECIPE_TAB_HEIGHT)
+        self.setCursor(Qt.PointingHandCursor)
+        self.hide()
+
+    # closed: only its arrow sticks out of the panel
+    def closed_width(self):
+        return RECIPE_TAB_ARROW + RECIPE_TAB_CLOSED_PAD
+
+    def set_state(self, side, level):
+        self.side, self.level = side, level
+        self.setToolTip("Fold the recipe manager back in" if level > 0.5
+                        else "Pull out the recipe manager: every recipe making this, and how much each makes")
+        self.update()
+
+    def enterEvent(self, event):
+        self.hovered = True
+        self.update()
+
+    def leaveEvent(self, event):
+        self.hovered = False
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.pressed = True
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.pressed:
+            self.pressed = False
+            if self.rect().contains(event.position().toPoint()):
+                self.on_click()
+            event.accept()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        right = self.side == "right"
+        box = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        radius = HOVER_BORDER_RADIUS + 2
+        shape = QPainterPath()
+        shape.addRoundedRect(box, radius, radius)
+        # square on the side it comes out of the panel by, flush against it
+        flush = QPainterPath()
+        flush.addRect(QRectF(box.left(), box.top(), radius, box.height()) if right
+                      else QRectF(box.right() - radius, box.top(), radius, box.height()))
+        shape = shape.united(flush)
+        painter.fillPath(shape, QColor(RECIPE_TAB_HOVER_BG if self.hovered else RECIPE_TAB_BG))
+        painter.setPen(QPen(QColor(OUTPUT_FIELD_BORDER), 1))
+        painter.drawPath(shape)
+        # The words, held by the panel's edge however far out the tab reaches:
+        # nothing of them while only the arrow sticks out, uncovered as the
+        # tab stretches out with the manager - never under the arrow
+        painter.save()
+        painter.setClipRect(QRectF(0, 0, self.width() - RECIPE_TAB_ARROW, self.height()) if right
+                            else QRectF(RECIPE_TAB_ARROW, 0, self.width() - RECIPE_TAB_ARROW, self.height()))
+        painter.setFont(self.font_used)
+        painter.setPen(QColor(TEXT_STRONG if self.hovered else TEXT_NORMAL))
+        width = QFontMetrics(self.font_used).horizontalAdvance(RECIPE_TAB_LABEL)
+        left = RECIPE_TAB_PAD if right else self.width() - RECIPE_TAB_PAD - width
+        painter.drawText(QRectF(left, 0, width + 2, self.height()), Qt.AlignLeft | Qt.AlignVCenter, RECIPE_TAB_LABEL)
+        painter.restore()
+        # the arrow at the far end: out, while closed - turned round to point
+        # back in as the manager comes out
+        closed, opened = (0, 180) if right else (180, 0)
+        angle = closed + (opened - closed) * self.level
+        # centered in its room, drawn bigger than its 16 unit square
+        arrow = (self.width() - RECIPE_TAB_ARROW / 2) if right else RECIPE_TAB_ARROW / 2
+        painter.translate(arrow, self.height() / 2)
+        painter.scale(RECIPE_TAB_ARROW_SCALE, RECIPE_TAB_ARROW_SCALE)
+        painter.translate(-SYMBOL_CANVAS / 2, -SYMBOL_CANVAS / 2)
+        draw_caret(painter, QColor(TEXT_STRONG if self.hovered else TEXT_MUTED), angle)
+        painter.end()
+
+# a recipe's small color square, left of its line
+class RecipeDot(QWidget):
+    def __init__(self, color, parent=None):
+        super().__init__(parent)
+        self.color = color
+        self.setFixedSize(RECIPE_MANAGER_DOT + 4, OUTPUT_RECIPE_HEIGHT)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(self.color))
+        side = RECIPE_MANAGER_DOT
+        # a small square, barely rounded: a swatch of the recipe's color
+        painter.drawRoundedRect(QRectF((self.width() - side) / 2, (self.height() - side) / 2, side, side), 1.5, 1.5)
+        painter.end()
+
+def make_recipe_manager(view):
+    panel = QWidget(view)
+    panel.setObjectName("recipe_manager")
+    panel.setAttribute(Qt.WA_StyledBackground, True)
+    panel.setStyleSheet(
+        "QWidget#recipe_manager {"
+        f"  background-color: {DIALOG_BG};"
+        f"  border: 1px solid {OUTPUT_FIELD_BORDER};"
+        f"  border-radius: {HOVER_BORDER_RADIUS + 2}px;"
+        "}"
+    )
+    panel.setFixedWidth(RECIPE_MANAGER_WIDTH)
+    panel.hide()
+    layout = QVBoxLayout(panel)
+    layout.setContentsMargins(16, RECIPE_TAB_HEIGHT + 12, 16, 16)
+    layout.setSpacing(10)
+
+    # a label that is part of what the panel is taken hold of by, not text
+    def still(label):
+        label.setTextInteractionFlags(Qt.NoTextInteraction)
+        label.unsetCursor()
+        return label
+
+    def small_title(text):
+        label = info_label(text.upper(), PANEL_TITLE_COLOR, NODE_INFO_SMALL_FONT_SIZE, bold=True)
+        label.setStyleSheet(label.styleSheet() + f" letter-spacing: {PANEL_TITLE_SPACING}px;")
+        return still(label)
+
+    # The tab it is pulled out by (see RecipeManagerTab): it stands over the
+    # manager's top, the manager's own title bar while it is out - so its
+    # contents start under it. Whoever opens the manager decides what a
+    # click on it does (panel.on_tab).
+    tab = RecipeManagerTab(view, lambda: panel.on_tab())
+    panel.on_tab = lambda: None
+
+    # what it is about: the item and the machines it is for - and, set apart
+    # at the right, how much they need: what every rate below adds up to
+    heading = QHBoxLayout()
+    heading.setSpacing(12)
+    picture = QLabel()
+    picture.setFixedSize(RECIPE_MANAGER_PICTURE_SIZE, RECIPE_MANAGER_PICTURE_SIZE)
+    heading.addWidget(picture, 0, Qt.AlignTop)
+    about = QVBoxLayout()
+    about.setSpacing(2)
+    name = still(info_label("", OUTPUT_NAME_COLOR, PANEL_FONT_SIZE, bold=True))
+    feeds = still(info_label("", TEXT_MUTED, NODE_INFO_SMALL_FONT_SIZE, wrap=True))
+    about.addWidget(name)
+    about.addWidget(feeds)
+    heading.addLayout(about, 1)
+    needed_box = QVBoxLayout()
+    needed_box.setSpacing(0)
+    needed_title = small_title("Needed")
+    needed = still(info_label("", TEXT_STRONG, PANEL_FONT_SIZE + 3, bold=True))
+    needed_unit = still(info_label("", TEXT_MUTED, NODE_INFO_SMALL_FONT_SIZE))
+    for label in (needed_title, needed, needed_unit):
+        label.setAlignment(Qt.AlignRight)
+        needed_box.addWidget(label)
+    needed_box.addStretch(1)
+    heading.addLayout(needed_box)
+    layout.addLayout(heading)
+    layout.addWidget(make_panel_divider())
+
+    # everything that can be edited: greyed out as one on a locked graph
+    editing = QWidget()
+    editing.setStyleSheet("background: transparent;")
+    editing_layout = QVBoxLayout(editing)
+    editing_layout.setContentsMargins(0, 0, 0, 0)
+    editing_layout.setSpacing(8)
+
+    # the columns' names, over the recipes and over their rates
+    columns = QHBoxLayout()
+    columns.setContentsMargins(RECIPE_MANAGER_DOT + 4 + OUTPUT_RECIPE_GAP, 0, 0, 0)
+    columns.setSpacing(OUTPUT_RECIPE_GAP)
+    columns.addWidget(small_title("Recipe"), 1)
+    rate_title = small_title("Rate")
+    rate_title.setFixedWidth(RECIPE_MANAGER_RATE_WIDTH)
+    rate_title.setAlignment(Qt.AlignRight)
+    columns.addWidget(rate_title)
+    columns.addSpacing(REMOVE_RECIPE_BUTTON_WIDTH + REMOVE_RECIPE_INSET)   # over the remove crosses
+    editing_layout.addLayout(columns)
+
+    lines_holder = QWidget()
+    lines_layout = QVBoxLayout(lines_holder)
+    lines_layout.setContentsMargins(0, 0, 0, 0)
+    lines_layout.setSpacing(6)
+    editing_layout.addWidget(lines_holder)
+
+    add_button = QPushButton("+  Add a recipe")
+    add_button.setCursor(Qt.PointingHandCursor)
+    add_button.setFocusPolicy(Qt.NoFocus)
+    add_button.setStyleSheet(
+        "QPushButton {"
+        "  background-color: transparent;"
+        f"  color: {TEXT_ACCENT};"
+        f"  border: 1px dashed {OUTPUT_FIELD_BORDER};"
+        f"  border-radius: {HOVER_BORDER_RADIUS}px;"
+        f"  font-size: {NODE_INFO_TEXT_FONT_SIZE}px;"
+        "  font-weight: bold;"
+        "  padding: 7px;"
+        "}"
+        f"QPushButton:hover {{ background-color: {TAB_SYMBOL_HOVER_BG}; color: {TAB_SELECTED_COLOR};"
+        f" border: 1px dashed {TAB_INDICATOR_COLOR}; }}"
+        f"QPushButton:pressed {{ background-color: {TAB_SYMBOL_PRESS_BG}; }}"
+        f"QPushButton:disabled {{ color: {TEXT_DISABLED}; border: 1px dashed {PANEL_DIVIDER_COLOR}; }}"
+    )
+    editing_layout.addWidget(add_button)
+    editing_layout.addSpacing(2)
+    editing_layout.addWidget(make_panel_divider())
+
+    # how the rates typed stand against what is needed: the bar, then in words
+    bar = RecipeShareBar()
+    editing_layout.addWidget(bar)
+    status_row = QHBoxLayout()
+    status_row.setSpacing(8)
+    assigned_label = still(info_label("", TEXT_MUTED, NODE_INFO_TEXT_FONT_SIZE))
+    hint_label = still(info_label("", TEXT_MUTED, NODE_INFO_SMALL_FONT_SIZE))
+    hint_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    status_row.addWidget(assigned_label)
+    status_row.addStretch(1)
+    status_row.addWidget(hint_label)
+    editing_layout.addLayout(status_row)
+
+    # Reset - the draft back to what the tree runs - and Apply, the one
+    # thing here that rebuilds it: wider, and in the accent once there is
+    # something to apply
+    buttons = QHBoxLayout()
+    buttons.setSpacing(8)
+    reset_button = QPushButton("Reset")
+    reset_button.setCursor(Qt.PointingHandCursor)
+    reset_button.setFocusPolicy(Qt.NoFocus)
+    reset_button.setFixedHeight(RECIPE_MANAGER_BUTTON_HEIGHT)
+    reset_button.setIconSize(QSize(CONFIRM_ICON_SIZE, CONFIRM_ICON_SIZE))
+    reset_button.setStyleSheet(
+        "QPushButton {"
+        "  background-color: transparent;"
+        f"  color: {TEXT_MUTED};"
+        f"  border: 1px solid {OUTPUT_FIELD_BORDER};"
+        f"  border-radius: {HOVER_BORDER_RADIUS}px;"
+        f"  font-size: {NODE_INFO_TEXT_FONT_SIZE}px;"
+        "  padding: 0 14px;"
+        "}"
+        f"QPushButton:hover {{ color: {TEXT_STRONG}; border-color: {TAB_SYMBOL_COLOR}; }}"
+        f"QPushButton:pressed {{ background-color: {TAB_SYMBOL_PRESS_BG}; }}"
+        f"QPushButton:disabled {{ color: {TEXT_FAINT}; border-color: {PANEL_DIVIDER_COLOR}; }}"
+    )
+    apply_button = QPushButton("Apply")
+    apply_button.setCursor(Qt.PointingHandCursor)
+    apply_button.setFocusPolicy(Qt.NoFocus)
+    apply_button.setFixedHeight(RECIPE_MANAGER_BUTTON_HEIGHT)
+    apply_button.setIconSize(QSize(CONFIRM_ICON_SIZE, CONFIRM_ICON_SIZE))
+    apply_button.setStyleSheet(
+        "QPushButton {"
+        f"  background-color: {TAB_INDICATOR_COLOR};"
+        f"  color: {TEXT_ON_ACCENT};"
+        f"  border: 1px solid {TAB_INDICATOR_COLOR};"
+        f"  border-radius: {HOVER_BORDER_RADIUS}px;"
+        f"  font-size: {NODE_INFO_TEXT_FONT_SIZE + 1}px;"
+        "  font-weight: bold;"
+        "  padding: 0 14px;"
+        "}"
+        f"QPushButton:hover {{ background-color: {CONFIRM_HOVER_BG}; border-color: {CONFIRM_HOVER_BG}; }}"
+        f"QPushButton:pressed {{ background-color: {ACCENT_PRESS_BG}; border-color: {ACCENT_PRESS_BG}; }}"
+        "QPushButton:disabled {"
+        "  background-color: transparent;"
+        f"  color: {TEXT_DISABLED};"
+        f"  border: 1px solid {PANEL_DIVIDER_COLOR};"
+        "}"
+    )
+    buttons.addWidget(reset_button)
+    buttons.addWidget(apply_button, 1)
+    editing_layout.addLayout(buttons)
+    layout.addWidget(editing)
+
+    # the item, the recipes the tree runs for it ([(Recipe, rate)]), what the
+    # machines need, and the draft being typed ([{"recipe", "rate", "field"}])
+    state = {"item": None, "applied": [], "total": 0.0, "draft": [], "progress": 0.0}
+    panel.on_apply = None
+
+    # a rate in a field: no thousands mark, nothing past its last figure
+    def typed_text(rate):
+        return f"{rate:.{OUTPUT_RATE_MAX_DECIMALS}f}".rstrip("0").rstrip(".")
+
+    def shown(rate):
+        return f"{rate:,.{OUTPUT_RATE_MAX_DECIMALS}f}".rstrip("0").rstrip(".")
+
+    # close enough to call the rates equal: as near as the fields can say
+    def tolerance():
+        return max(10 ** -OUTPUT_RATE_MAX_DECIMALS * 0.6, state["total"] * 1e-9)
+
+    def assigned():
+        return sum(line["rate"] for line in state["draft"])
+
+    def matches():
+        return state["total"] > 0 and abs(assigned() - state["total"]) <= tolerance()
+
+    # what applying would do: the recipes making something, at their rates
+    def effective(lines):
+        return sorted((recipe.full_name, round(rate, OUTPUT_RATE_MAX_DECIMALS))
+                      for recipe, rate in lines if rate > tolerance())
+
+    def changed():
+        return effective([(line["recipe"], line["rate"]) for line in state["draft"]]) != effective(state["applied"])
+
+    def color_of(index):
+        return RECIPE_MANAGER_COLORS[index % len(RECIPE_MANAGER_COLORS)]
+
+    # the item's recipes not in the draft yet, to pick the one to add
+    def unused():
+        listed = [line["recipe"] for line in state["draft"]]
+        return [recipe for recipe in state["item"].recipes if recipe not in listed] if state["item"] else []
+
+    # the bar, the words under it and the buttons, read off the draft
+    def show_status():
+        item = state["item"]
+        if item is None:
+            return
+        total, given = state["total"], assigned()
+        unit = rate_unit(item)
+        met = matches()
+        bar.set_shares([(color_of(index), line["rate"]) for index, line in enumerate(state["draft"])], total, met)
+        color = RECIPE_MANAGER_MATCH_COLOR if met else TEXT_MUTED
+        assigned_label.setStyleSheet(f"color: {color}; font-size: {NODE_INFO_TEXT_FONT_SIZE}px;"
+                                     " background: transparent;")
+        assigned_label.setText(f"<b>{shown(given)}</b> of {shown(total)} {unit}")
+        if met:
+            hint, hint_color = "Matches what is needed", RECIPE_MANAGER_MATCH_COLOR
+        elif given < total:
+            hint, hint_color = f"{shown(total - given)} {unit} left to share out", TEXT_FAINT
+        else:
+            hint, hint_color = f"{shown(given - total)} {unit} too much", TEXT_FAINT
+        hint_label.setStyleSheet(f"color: {hint_color}; font-size: {NODE_INFO_SMALL_FONT_SIZE}px;"
+                                 " background: transparent;")
+        hint_label.setText(hint)
+        dirty = changed()
+        locked = panel_options["locked"]
+        ready = met and dirty and not locked
+        apply_button.setEnabled(ready)
+        apply_button.setIcon(symbol_icon(draw_done_tick, TEXT_ON_ACCENT if ready else TEXT_DISABLED))
+        apply_button.setToolTip("Rebuild the tree with these recipes and rates" if ready
+                                else LOCKED_TOOLTIP if locked
+                                else "Nothing changed yet" if not dirty
+                                else f"The rates have to add up to {shown(total)} {unit} first")
+        reset_button.setEnabled(dirty and not locked)
+        reset_button.setIcon(symbol_icon(draw_build_cancel, TEXT_MUTED if dirty and not locked else TEXT_FAINT))
+        reset_button.setToolTip("Put back the recipes and rates the tree runs now" if dirty else "")
+        left = unused()
+        add_button.setEnabled(bool(left))
+        add_button.setToolTip(f"Make some {item.display_name} another way - added at 0, for its rate to be typed"
+                              if left else f"Every recipe of {item.display_name} is in the list already")
+
+    def make_line(index, line, alone):
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(OUTPUT_RECIPE_GAP)
+        row_layout.addWidget(RecipeDot(color_of(index)))
+        field, get_recipe = make_recipe_dropdown(
+            state["item"], line["recipe"], on_change=lambda: switch(line, get_recipe()))
+        field.set_used([other["recipe"] for other in state["draft"] if other is not line])
+        row_layout.addWidget(field, 1)
+        rate = QLineEdit(typed_text(line["rate"]))
+        rate.setFixedSize(RECIPE_MANAGER_RATE_WIDTH, OUTPUT_RECIPE_HEIGHT)
+        rate.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        rate.setValidator(rate_validator(rate))
+        rate.setToolTip(f"What this recipe makes, in {rate_unit(state['item'])}\n{RATE_SUM_HINT}")
+        rate.setStyleSheet(
+            "QLineEdit {"
+            f"  background-color: {OUTPUT_FIELD_BG};"
+            f"  color: {TAB_SELECTED_COLOR};"
+            f"  border: 1px solid {OUTPUT_FIELD_BORDER};"
+            f"  border-radius: {HOVER_BORDER_RADIUS}px;"
+            f"  font-size: {OUTPUT_RECIPE_FONT_SIZE}px;"
+            "  padding: 0 8px;"
+            "}"
+            f"QLineEdit:focus {{ background-color: {OUTPUT_FIELD_EDITING_BG}; border: 1px solid {TAB_INDICATOR_COLOR}; }}"
+            f"QLineEdit:hover:!focus {{ border: 1px solid {TAB_SYMBOL_COLOR}; }}"
+            f"QLineEdit:disabled {{ color: {TEXT_MUTED}; }}"
+        )
+
+        # read as it is typed: the total and the buttons follow every figure
+        def typing(text):
+            rate = evaluate_rate(text)   # a sum as soon as it is a whole one
+            if rate is None:
+                return
+            line["rate"] = rate
+            show_status()
+
+        rate.textEdited.connect(typing)
+        rate.editingFinished.connect(lambda: rate.setText(typed_text(line["rate"])))
+        rate.returnPressed.connect(lambda: apply() if apply_button.isEnabled() else None)
+        line["field"] = rate
+        row_layout.addWidget(rate)
+        # the small grey cross taking this one recipe off, set in from the
+        # edge, out of the column of the cross shutting the manager - greyed
+        # out further on the only one
+        remove = make_remove_recipe_button(OUTPUT_RECIPE_HEIGHT, alone)
+        if not alone:
+            remove.setToolTip("Remove this recipe - its rate is left to share out")
+            remove.clicked.connect(lambda: remove_line(line))
+        row_layout.addWidget(remove)
+        row_layout.addSpacing(REMOVE_RECIPE_INSET - OUTPUT_RECIPE_GAP)
+        return row
+
+    def show_lines():
+        while lines_layout.count():
+            entry = lines_layout.takeAt(0)
+            if entry.widget() is not None:
+                entry.widget().hide()
+                entry.widget().deleteLater()
+        alone = len(state["draft"]) < 2
+        for index, line in enumerate(state["draft"]):
+            row = make_line(index, line, alone)
+            lines_layout.addWidget(row)
+            row.show()
+
+    # the draft changed shape - a line in or out, a recipe switched: its
+    # lines made again, and the panel resized to them
+    def redraw():
+        show_lines()
+        show_status()
+        place()
+
+    # One line's recipe switched for another - taken into the line already
+    # running that one, should there be one, their rates added together
+    def switch(line, recipe):
+        if recipe is line["recipe"]:
+            return
+        twin = next((other for other in state["draft"] if other["recipe"] is recipe), None)
+        if twin is not None:
+            twin["rate"] += line["rate"]
+            state["draft"].remove(line)
+        else:
+            line["recipe"] = recipe
+        QTimer.singleShot(0, redraw)   # once the list the pick came from has closed
+
+    def remove_line(line):
+        if len(state["draft"]) > 1 and line in state["draft"]:
+            state["draft"].remove(line)
+            QTimer.singleShot(0, redraw)
+
+    # added at nothing, its rate field ready to type in
+    def add(recipe):
+        line = {"recipe": recipe, "rate": 0.0}
+        state["draft"].append(line)
+        redraw()
+        field = line.get("field")
+        if field is not None:
+            field.setFocus()
+            field.selectAll()
+
+    def pick_to_add():
+        menu = QMenu(add_button)
+        menu.setStyleSheet(
+            "QMenu {"
+            f"  background: {MENU_BG}; color: {TEXT_NORMAL};"
+            f"  border: 1px solid {OUTPUT_FIELD_BORDER}; border-radius: {HOVER_BORDER_RADIUS}px;"
+            f"  padding: 4px; font-size: {OUTPUT_RECIPE_FONT_SIZE}px;"
+            "}"
+            "QMenu::item { padding: 7px 22px 7px 14px; border-radius: 3px; }"
+            f"QMenu::item:selected {{ background: {SELECTION_BG}; color: {TAB_SELECTED_COLOR}; }}"
+        )
+        for recipe in unused():
+            menu.addAction(recipe.display_name, lambda recipe=recipe: QTimer.singleShot(0, lambda: add(recipe)))
+        menu.setMinimumWidth(add_button.width())
+        menu.exec(add_button.mapToGlobal(QPoint(0, add_button.height() + 2)))
+
+    def reset():
+        state["draft"] = [{"recipe": recipe, "rate": rate} for recipe, rate in state["applied"]]
+        redraw()
+
+    # the draft, as shares of what is needed, handed over to rebuild the tree
+    # with - the lines left at nothing dropping out
+    def apply():
+        total = state["total"]
+        if not matches() or not changed() or panel.on_apply is None or panel_options["locked"]:
+            return
+        split = [(line["recipe"], line["rate"] / total) for line in state["draft"] if line["rate"] > tolerance()]
+        if split:
+            item = state["item"]
+            QTimer.singleShot(0, lambda: panel.on_apply(item, split))
+
+    add_button.clicked.connect(pick_to_add)
+    reset_button.clicked.connect(reset)
+    apply_button.clicked.connect(apply)
+
+    # The info panel it comes out of, while one stands open on a box - None
+    # while it is shut, or on its way out
+    def info_open():
+        info = getattr(view, "info_panel", None)
+        node = getattr(view, "info_node", lambda: None)()
+        closing = getattr(view, "info_closing", None)   # shut, but still drawing back: bolted on to the end
+        try:
+            if closing is not None and closing.isVisible():
+                return closing
+            return info if info is not None and node is not None and info.isVisible() else None
+        except RuntimeError:
+            return None   # the panel of a scene drawn over since
+
+    # Where everything stands, `state["progress"]` of the way out: the
+    # manager slid out of the info panel's side by that much - against its
+    # right side, or its left when the map has no room there, level with its
+    # top - what is still over the panel hidden behind it, and the tab
+    # reaching out along its top to its far edge. With no info panel open (a
+    # rebuild being played through) it stays where it last stood, the tab
+    # with it. The tab shows while the manager is out, and on any box whose
+    # item it can manage.
+    def arrange():
+        viewport = view.viewport()
+        layout.activate()
+        wanted = (layout.totalHeightForWidth(RECIPE_MANAGER_WIDTH) if layout.hasHeightForWidth()
+                  else layout.totalSizeHint().height())
+        panel.setFixedHeight(min(wanted, max(NODE_INFO_MIN_HEIGHT, viewport.height() - 2 * NODE_INFO_MARGIN)))
+        width, height = panel.width(), panel.height()
+        level = state["progress"]
+        info = info_open()
+        if info is not None:
+            beside = info.geometry()
+            side = "right" if beside.right() + width <= viewport.width() - NODE_INFO_MARGIN else "left"
+            edge = beside.right() if side == "right" else beside.left()
+            top = beside.top()
+            info_item = managed_item(view.info_node())
+        else:
+            side = state.get("side", "right")
+            spot = state.get("spot")
+            if spot is None:
+                spot = QPoint(viewport.width() - width - NODE_INFO_MARGIN, NODE_INFO_MARGIN)
+            edge = spot.x() if side == "right" else spot.x() + width - 1
+            top = spot.y()
+            info_item = None
+        right = side == "right"
+        out = round(width * level)
+        y = max(NODE_INFO_MARGIN, min(top, viewport.height() - height - NODE_INFO_MARGIN))
+        final_x = edge if right else edge - width + 1
+        panel.move(final_x - (width - out) if right else final_x + (width - out), y)
+        # only what has come out past the panel's side shows
+        if out >= width:
+            panel.clearMask()
+        else:
+            shown_part = max(1, out)
+            panel.setMask(QRegion(QRect(width - shown_part, 0, shown_part, height) if right
+                                  else QRect(0, 0, shown_part, height)))
+        if info is not None:
+            panel.stackUnder(info)
+        else:
+            panel.raise_()
+        state["spot"], state["side"] = QPoint(final_x, y), side
+        # the tab, along the manager's top - at the panel's top while it is in
+        if not panel.isHidden() or info_item is not None:
+            reach = max(tab.closed_width(), out)
+            tab_y = y if not panel.isHidden() else max(NODE_INFO_MARGIN, top)
+            tab.setGeometry(edge if right else edge - reach + 1, tab_y, reach, RECIPE_TAB_HEIGHT)
+            tab.set_state(side, level)
+            tab.show()
+            tab.raise_()
+        else:
+            tab.hide()
+
+    # Pulled out of the info panel, or pushed back in: `opening` says which,
+    # from however far out it is now - so shut half way out it goes back in
+    # from there, and opened again on its way in, it turns round.
+    def slide(opening, done=None):
+        running = state.get("slide")
+        if running is not None:
+            running.stop()
+        state["closing"] = not opening
+        start, end = state["progress"], 1.0 if opening else 0.0
+        motion = QVariantAnimation(panel)
+        motion.setDuration(max(1, round(RECIPE_MANAGER_SLIDE_MS * abs(end - start))))
+        motion.setStartValue(float(start))
+        motion.setEndValue(end)
+        motion.setEasingCurve(QEasingCurve.OutCubic if opening else QEasingCurve.InOutCubic)
+
+        def step(value):
+            state["progress"] = value
+            arrange()
+
+        def finished():
+            if state.get("slide") is not motion:
+                return
+            state["slide"] = None
+            if done is not None:
+                done()
+            arrange()
+
+        motion.valueChanged.connect(step)
+        motion.finished.connect(finished)
+        state["slide"] = motion
+        motion.start(QAbstractAnimation.DeleteWhenStopped)
+
+    # what the rest of it calls: everything put back where it stands now
+    def place():
+        arrange()
+
+    def refresh(nodes):
+        item = state["item"]
+        if item is None:
+            return
+        takers = search.inner_supply(nodes or [], item)
+        if not takers:
+            close()
+            return
+        flows = {}
+        for _, suppliers in takers:
+            for supplier, flow in suppliers.items():
+                flows[supplier.recipe] = flows.get(supplier.recipe, 0.0) + flow
+        state["applied"] = list(flows.items())
+        state["total"] = sum(flows.values())
+        state["draft"] = [{"recipe": recipe, "rate": rate} for recipe, rate in state["applied"]]
+        picture.setPixmap(picture_label(item_picture(item), RECIPE_MANAGER_PICTURE_SIZE).pixmap())
+        name.setText(item.display_name)
+        machines = sorted({mother.recipe.display_name for mother, _ in takers})
+        feeds.setText("For " + ", ".join(machines))
+        needed.setText(shown(state["total"]))
+        needed_unit.setText(rate_unit(item))
+        # a locked graph cannot be rebuilt: what it says stays readable
+        editing.setEnabled(not panel_options["locked"])
+        editing.setToolTip(LOCKED_TOOLTIP if panel_options["locked"] else "")
+        redraw()
+
+    # Gone with the info panel it is bolted to, as that one draws back toward
+    # its box: fading out over `duration`, still bolted to it and moving with
+    # it, the tab too - rather than sliding back in on its own.
+    def fold_away(duration):
+        if panel.isHidden():
+            return
+        was = state["item"]
+        state["item"] = None
+        running = state.get("slide")
+        if running is not None:
+            running.stop()
+            state["slide"] = None
+        effects = []
+        for widget in (panel, tab):
+            effect = QGraphicsOpacityEffect(widget)
+            widget.setGraphicsEffect(effect)
+            effects.append(effect)
+        fade = QVariantAnimation(panel)
+        fade.setDuration(duration)
+        fade.setStartValue(1.0)
+        fade.setEndValue(0.0)
+        fade.setEasingCurve(QEasingCurve.InCubic)
+        fade.valueChanged.connect(lambda value: [effect.setOpacity(value) for effect in effects])
+
+        def finished():
+            if state.get("fold") is not fade:
+                return
+            state["fold"] = None
+            for widget in (panel, tab):
+                widget.setGraphicsEffect(None)
+            panel.hide()
+            panel.clearMask()
+            state["progress"] = 0.0
+            arrange()
+
+        fade.finished.connect(finished)
+        state["fold"] = fade
+        fade.start(QAbstractAnimation.DeleteWhenStopped)
+        if was is not None:
+            panel.on_shown(False)
+
+    # opened again while folding away: whole again, where it stands
+    def stop_fold():
+        fade, state["fold"] = state.get("fold"), None
+        if fade is not None:
+            fade.stop()
+            for widget in (panel, tab):
+                widget.setGraphicsEffect(None)
+            panel.hide()
+            panel.clearMask()
+            state["progress"] = 0.0
+
+    def show_item(item, nodes):
+        stop_fold()
+        opening = panel.isHidden()
+        state["item"] = item
+        refresh(nodes)
+        if state["item"] is None:
+            return
+        if opening:
+            state["progress"] = 0.0
+        panel.show()
+        if opening or state.get("closing"):
+            slide(True)   # pulled out of the info panel - or turned round on its way in
+        else:
+            pulse(panel)
+        panel.on_shown(True)
+
+    def close():
+        was = state["item"]
+        state["item"] = None
+        if not panel.isHidden():
+            # pushed back in behind it, and gone - unless opened again on the way
+            slide(False, lambda: panel.hide() if state["item"] is None else None)
+        if was is not None:
+            panel.on_shown(False)
+
+    panel.on_shown = lambda on: None   # (open), for the info panel's button to say so
+
+    # the map resized: it keeps to its edge
+    class Keep(QObject):
+        def eventFilter(self, watched, event):
+            if event.type() == QEvent.Resize:
+                arrange()
+            return False
+
+    panel.keep = Keep(panel)
+    view.viewport().installEventFilter(panel.keep)
+    panel.show_item = show_item
+    panel.refresh = refresh
+    panel.close_manager = close
+    panel.fold_away = fold_away
+    # the info panel moved with its node as the map pans or zooms, opened on
+    # another box or shut: the manager and its tab follow
+    panel.follow = arrange
+    panel.item = lambda: state["item"]
+    return panel
 
 # Qt.Popup makes this its own window: it grabs input, closes on an outside click
 # or Escape, and can spill past the panel's edges, exactly like the menu did.
@@ -10627,13 +13250,19 @@ def make_search_popup(parent, items, on_pick, is_taken=None, picture=None):
 # so the caller never has to know about the title row or the scrolling.
 # a strip of tabs, one of them always down: the same one the left panel's
 # pages use. `on_select` gets the index picked; the first starts selected.
-def make_tab_strip(titles, on_select, accents=None):
+# `compact`: a row of tabs under another - lower, in smaller type, the one
+# picked shown by its ground and bold name rather than an accent line, so it
+# reads as part of the tab above it rather than a rival to it.
+def make_tab_strip(titles, on_select, accents=None, compact=False):
     strip = QWidget()
     strip.setObjectName("left_tabs")
     strip.setAttribute(Qt.WA_StyledBackground, True)
+    ground = LEFT_PANEL_SUBTAB_BG if compact else LEFT_PANEL_TAB_BG
+    hover = LEFT_PANEL_SUBTAB_HOVER_BG if compact else LEFT_PANEL_TAB_HOVER_BG
+    checked = LEFT_PANEL_SUBTAB_CHECKED_BG if compact else LEFT_PANEL_TAB_CHECKED_BG
     strip.setStyleSheet(
         "QWidget#left_tabs {"
-        f"  background: {LEFT_PANEL_TAB_BG};"
+        f"  background: {ground};"
         f"  border-radius: {HOVER_BORDER_RADIUS}px;"
         "}"
     )
@@ -10670,64 +13299,83 @@ def make_tab_strip(titles, on_select, accents=None):
         tab.setFocusPolicy(Qt.NoFocus)
         tab.setStyleSheet(
             "QPushButton {"
-            f"  font-size: {PANEL_FONT_SIZE}px;"
-            f"  padding: {LEFT_PANEL_TAB_PADDING}px;"
+            f"  font-size: {OUTPUT_RECIPE_FONT_SIZE if compact else PANEL_FONT_SIZE}px;"
+            f"  padding: {LEFT_PANEL_SUBTAB_PADDING if compact else LEFT_PANEL_TAB_PADDING}px;"
             "  border: none;"
-            f"  border-bottom: {LEFT_PANEL_TAB_INDICATOR}px solid transparent;"
+            f"  border-bottom: {0 if compact else LEFT_PANEL_TAB_INDICATOR}px solid transparent;"
             + corners +
-            f"  background: {LEFT_PANEL_TAB_BG};"
+            f"  background: {ground};"
             f"  color: {TAB_UNSELECTED_COLOR};"
             "}"
             "QPushButton:hover {"
             f"  color: {TAB_SYMBOL_HOVER_COLOR};"
-            f"  background: {LEFT_PANEL_TAB_HOVER_BG};"
+            f"  background: {hover};"
             "}"
             "QPushButton:pressed {"
             f"  background: {TAB_SYMBOL_PRESS_BG};"
             "}"
             "QPushButton:checked {"
-            f"  background: {LEFT_PANEL_TAB_CHECKED_BG};"
+            f"  background: {checked};"
             f"  color: {TAB_SELECTED_COLOR};"
-            f"  border-bottom: {LEFT_PANEL_TAB_INDICATOR}px solid {TAB_INDICATOR_COLOR};"
-            "  border-bottom-left-radius: 0; border-bottom-right-radius: 0;"
+            + ("" if compact else
+               f"  border-bottom: {LEFT_PANEL_TAB_INDICATOR}px solid {TAB_INDICATOR_COLOR};"
+               "  border-bottom-left-radius: 0; border-bottom-right-radius: 0;") +
             "  font-weight: bold;"
             "}"
         )
         # a small count in the corner, for how many cards that tab holds. Each
-        # wears its own tab's accent whichever tab is down, so the two counts
-        # can be told apart at a glance: fixed_accent keeps the app-wide swap
-        # off it (see accent_widgets).
-        badge = CountBadge("0", tab)
-        badge.setObjectName("tab_badge")
-        badge.setProperty("fixed_accent", True)
-        badge.setAlignment(Qt.AlignCenter)
-        badge.setFixedSize(TAB_BADGE_SIZE, TAB_BADGE_SIZE)
-        badge.setStyleSheet(
-            "QLabel#tab_badge {"
-            f"  background: {ACCENT_SHADES[accents[index]]['base'] if accents else TAB_BADGE_BG};"
-            f"  color: {TAB_BADGE_COLOR};"
-            f"  border-radius: {TAB_BADGE_SIZE // 2}px;"
-            "}"
-        )
-        badge.hide()   # nothing in that list yet: no point in a zero
-        tab.badge = badge
+        # wears its own tab's accent whichever tab is down, so the counts can
+        # be told apart at a glance: fixed_accent keeps the app-wide swap off
+        # it (see accent_widgets). A tab over several lists - Power, over the
+        # generators and the consumers - takes a tuple of accents and wears a
+        # count for each, side by side in that order.
+        shades = accents[index] if accents else None
+        shades = shades if isinstance(shades, tuple) else (shades,)
+        badge_size = TAB_BADGE_SIZE_COMPACT if compact else TAB_BADGE_SIZE
+        tab.badges = []
+        for shade in shades:
+            badge = CountBadge("0", tab)
+            badge.setObjectName("tab_badge")
+            badge.setProperty("fixed_accent", True)
+            badge.setAlignment(Qt.AlignCenter)
+            badge.setFixedSize(badge_size, badge_size)
+            badge.setStyleSheet(
+                "QLabel#tab_badge {"
+                f"  background: {ACCENT_SHADES[shade]['base'] if shade else TAB_BADGE_BG};"
+                f"  color: {TAB_BADGE_COLOR};"
+                f"  border-radius: {badge_size // 2}px;"
+                + (f"  font-size: {TAB_BADGE_FONT_COMPACT}px;" if compact else "") +
+                "}"
+            )
+            badge.hide()   # nothing in that list yet: no point in a zero
+            tab.badges.append(badge)
 
-        def place_badge(tab=tab, badge=badge):
-            badge.move(tab.width() - badge.width() - TAB_BADGE_MARGIN, TAB_BADGE_MARGIN)
-            badge.raise_()
+        # in the corner, the last shown at the edge and the others in to its
+        # left - so a lone count sits in the corner whichever it is. On a
+        # compact tab, too low for a corner, centred in height.
+        def place_badge(tab=tab):
+            right = tab.width() - TAB_BADGE_MARGIN
+            for badge in reversed([badge for badge in tab.badges if not badge.isHidden()]):
+                top = (tab.height() - badge.height()) // 2 if compact else TAB_BADGE_MARGIN
+                right -= badge.width()
+                badge.move(right, top)
+                badge.raise_()
+                right -= TAB_BADGE_GAP
+        tab.place_badge = place_badge
 
         tab.resizeEvent = lambda event, place=place_badge: place()
         tab.clicked.connect(lambda checked=False, position=index: select(position))
         row.addWidget(tab, 1)
         tabs.append(tab)
 
-    # how many each holds, from the caller
+    # how many each holds, from the caller: a number per tab, or a tuple of
+    # them for a tab wearing several counts
     def set_counts(counts):
         for tab, count in zip(tabs, counts):
-            tab.badge.setText(str(count))
-            tab.badge.setVisible(bool(count))
-            tab.badge.move(tab.width() - tab.badge.width() - TAB_BADGE_MARGIN, TAB_BADGE_MARGIN)
-            tab.badge.raise_()
+            for badge, number in zip(tab.badges, count if isinstance(count, tuple) else (count,)):
+                badge.setText(str(number))
+                badge.setVisible(bool(number))
+            tab.place_badge()
 
     strip.set_counts = set_counts
     return strip, tabs
@@ -11030,11 +13678,17 @@ def make_option_row(label_text, values, pictures, current, on_change, stat_for=N
 LEFT_PANEL_PAGES = ("Recipes", "Details")
 LEFT_PANEL_TAB_PADDING = 8
 LEFT_PANEL_TAB_INDICATOR = 2      # the accent line under the page being shown
+LEFT_PANEL_SUBTAB_PADDING = 6     # the compact row under the tabs (see make_tab_strip)
+TAB_BADGE_SIZE_COMPACT = 16
+TAB_BADGE_FONT_COMPACT = 10
 LEFT_PANEL_TAB_BG = "#262626"         # a shade darker than the panel behind them
 LEFT_PANEL_TAB_HOVER_BG = "#303030"
 LEFT_PANEL_TAB_CHECKED_BG = "#232323"
 LEFT_PANEL_TAB_DIVIDER = "rgba(255, 255, 255, 0.14)"   # the faint line between two options
 LEFT_PANEL_TAB_DIVIDER_HEIGHT = 18
+LEFT_PANEL_SUBTAB_BG = "#333333"          # the compact row under the tabs: a shade lighter
+LEFT_PANEL_SUBTAB_HOVER_BG = "#3b3b3b"
+LEFT_PANEL_SUBTAB_CHECKED_BG = "#2b2b2b"
 
 # the panel on the canvas' left: the right one's twin in size and look. A row
 # of options at its top - Recipes, Details - flips the page shown under it;
@@ -11566,14 +14220,15 @@ def make_side_panel(on_confirm):
     # and the build reads them together.
     # Each a grid: one column of full cards, or compact tiles two to a row.
     pages = {}
-    for side in ("output", "generator"):
+    for side in PANEL_TAB_SIDES:
         page = QWidget()
         page.setStyleSheet("background: transparent;")
         page_layout = QGridLayout(page)
         page_layout.setContentsMargins(0, 0, 0, 0)
         page_layout.setSpacing(10)
         pages[side] = page
-    pages["generator"].hide()
+    for side in PANEL_TAB_SIDES[1:]:
+        pages[side].hide()
     current = ["output"]
     compact = [panel_options["outputs_compact"]]
 
@@ -11665,17 +14320,18 @@ def make_side_panel(on_confirm):
         row.slide = slide
         run(slide)
 
-    # an item can be an output several times, each with a recipe of its own:
-    # never the same item made the same way twice
+    # an item is made several ways on its one card - power on one card per
+    # generator - and never the same way twice
     def used_recipes(item):
-        return [entry["get_recipe"]() for entry in added_outputs if entry["item"] is item]
+        return [recipe for entry in added_outputs if entry["item"] is item
+                for recipe, _ in entry["get_parts"]()]
 
-    # every card of the item greys out, in its dropdown, what the others run
+    # every card of the item greys out, in its dropdowns, what the others run
     def refresh_used(item):
         for entry in added_outputs:
             if entry["item"] is item:
-                others = [other["get_recipe"]() for other in added_outputs
-                          if other["item"] is item and other is not entry]
+                others = [recipe for other in added_outputs if other["item"] is item and other is not entry
+                          for recipe, _ in other["get_parts"]()]
                 entry["row"].set_used(others)
 
     def remove_output(entry):
@@ -11845,13 +14501,21 @@ def make_side_panel(on_confirm):
                 schedule_save()
 
     # one card, on whichever list it belongs to
-    def add_card(item, recipe, side, start=None):
-        row, remove_button, get_rate, get_recipe = make_output_row(
-            item, recipe, start=start, on_rate_change=refresh_confirm,
-            # a recipe picked on a card is a change to build again, and one to
-            # be able to cancel, as much as a card added or a rate typed
-            on_recipe_change=lambda: (refresh_used(item), refresh_confirm()))
-        entry = {"item": item, "get_rate": get_rate, "get_recipe": get_recipe, "row": row, "side": side}
+    def add_card(item, recipe, side, start=None, shares=None):
+        if side == "consumer":
+            # a building that only draws power: a count of them, no recipe
+            row, remove_button, get_rate, get_recipe = make_consumer_row(
+                item, start=start, on_rate_change=refresh_confirm)
+        else:
+            row, remove_button, get_rate, get_recipe = make_output_row(
+                item, recipe, start=start, on_rate_change=refresh_confirm, shares=shares,
+                # a recipe picked on a card is a change to build again, and one to
+                # be able to cancel, as much as a card added or a rate typed
+                on_recipe_change=lambda: (refresh_used(item), refresh_confirm()))
+            if hasattr(row, "show_boost"):
+                row.show_boost(panel.grid_power())
+        entry = {"item": item, "get_rate": get_rate, "get_recipe": get_recipe, "get_parts": row.get_parts,
+                 "row": row, "side": side}
         added_outputs.append(entry)
         remove_button.clicked.connect(lambda: remove_output(entry))
         row.drag = CardDrag(entry, row)   # kept alive by the card
@@ -11867,14 +14531,32 @@ def make_side_panel(on_confirm):
         unroll(row)   # the card unrolls into the list rather than popping in
 
     def add_output(item):
-        # a second of the same item starts on the first recipe not taken yet -
-        # the one picked for the item on the Recipes page, if that is free
+        # a second of the same item is made another way on its card: the first
+        # recipe not taken yet - the one picked for the item on the Recipes
+        # page, if that is free - added at nothing, for its rate to be typed
         used = used_recipes(item)
         free = [recipe for recipe in item.recipes if recipe not in used]
         if not free:
             return   # every recipe runs already; the list greys such an item out
         picked = panel_options["recipe_choices"].get(item)
-        add_card(item, picked if picked in free else free[0], "output")
+        recipe = picked if picked in free else free[0]
+        card = next((entry for entry in added_outputs if entry["item"] is item and entry["side"] == "output"), None)
+        if card is None:
+            add_card(item, recipe, "output")
+            return
+        # once the list it was picked in has closed: its rate field takes the focus
+        QTimer.singleShot(0, lambda: card["row"].add_line(recipe) if card in added_outputs else None)
+
+    # A building that only draws power lands as a card for one of them. One
+    # already on the list gets one more instead: one card per building.
+    def add_consumer(building):
+        card = next((entry for entry in added_outputs
+                     if entry["side"] == "consumer" and entry["item"] is building), None)
+        if card is None:
+            add_card(building, None, "consumer", start=1)
+        else:
+            card["row"].add_one()
+            pulse(card["row"])
 
     # a generator is picked by its recipe - burn coal, burn fuel - and lands as
     # a card asking for so many megawatts made that way
@@ -11892,7 +14574,7 @@ def make_side_panel(on_confirm):
     generator_popup, generator_field = make_search_popup(
         panel, GENERATOR_RECIPES, add_generator,
         is_taken=lambda recipe: recipe in used_recipes(POWER_ITEM),
-        picture=lambda recipe: picture_or_missing(recipe.machine[0].picture))
+        picture=lambda recipe: machine_picture(recipe.machine[0]))
 
     def toggle_search():
         search_popup, search_field = (popups[current[0]])
@@ -11942,8 +14624,13 @@ def make_side_panel(on_confirm):
         run(opacity)
         search_field.setFocus()
 
+    # what only draws power, in the order the game data offers it
+    consumer_popup, consumer_field = make_search_popup(
+        panel, search.consumer_buildings(), add_consumer,
+        picture=power_building_picture)
     popups = {"output": (search_popup, search_field),
-              "generator": (generator_popup, generator_field)}
+              "generator": (generator_popup, generator_field),
+              "consumer": (consumer_popup, consumer_field)}
     add_button.clicked.connect(toggle_search)
 
     confirm_button = make_confirm_button(BUILD_LABELS["generate"], "build_confirm")
@@ -12008,22 +14695,61 @@ def make_side_panel(on_confirm):
     # half of the plan is in front of you.
     def show_side(side):
         current[0] = side
+        # the tabs say where it is: Power over either of its lists, and
+        # under it which one - that row only there while Power is open
+        powered = side in POWER_LIST_SIDES
+        for position, tab in enumerate(top_tabs):
+            tab.setChecked(position == (1 if powered else 0))
+        if powered:
+            power_side[0] = side
+            for position, tab in enumerate(power_tabs):
+                tab.setChecked(POWER_LIST_SIDES[position] == side)
+            if power_row.isHidden():
+                power_row.show()
+                unroll(power_row)
+        elif not power_row.isHidden():
+            roll_up(power_row, power_row.hide)
         for name, page in pages.items():
             page.setVisible(name == side)
-        add_button.setText(ADD_OUTPUT_LABEL if side == "output" else ADD_GENERATOR_LABEL)
-        clear_button.setToolTip("Remove every output" if side == "output" else "Remove every generator")
+        add_button.setText({"output": ADD_OUTPUT_LABEL, "generator": ADD_GENERATOR_LABEL,
+                            "consumer": ADD_CONSUMER_LABEL}[side])
+        clear_button.setToolTip({"output": "Remove every output", "generator": "Remove every generator",
+                                 "consumer": "Remove every consumer"}[side])
         for popup, _ in popups.values():
             popup.hide()
-        set_accent("blue" if side == "output" else "yellow", panel.window())
+        set_accent(SIDE_ACCENTS[side], panel.window())
         refresh_confirm()
         fade_in(pages[side])
 
-    tab_strip, side_tabs = make_tab_strip(PANEL_TAB_LABELS, lambda index: show_side(PANEL_TAB_SIDES[index]),
-                                          accents=PANEL_TAB_ACCENTS)
+    # Output, or Power - which opens on the power list last looked at,
+    # Generator to start with
+    power_side = ["generator"]
+    tab_strip, top_tabs = make_tab_strip(
+        PANEL_TOP_LABELS, lambda index: show_side("output" if index == 0 else power_side[0]),
+        accents=PANEL_TOP_ACCENTS)
+    power_strip, power_tabs = make_tab_strip(
+        POWER_LIST_LABELS, lambda index: show_side(POWER_LIST_SIDES[index]), accents=POWER_LIST_ACCENTS,
+        compact=True)
+    power_row = QWidget()
+    power_row.setStyleSheet("background: transparent;")
+    power_layout = QVBoxLayout(power_row)
+    power_layout.setContentsMargins(0, POWER_LIST_GAP, 0, 0)
+    power_layout.setSpacing(0)
+    power_layout.addWidget(power_strip)
+    power_row.hide()
 
     # top half : everything about the outputs
     output_section, output_body = make_panel_section(PANEL_SECTIONS[0])
-    output_section.pinned.addWidget(tab_strip)   # the two lists, above the button that fills them
+    # the lists, above the button that fills them, and Power's own two right
+    # under them: one block, out of the reach of the section's spacing
+    tab_block = QWidget()
+    tab_block.setStyleSheet("background: transparent;")
+    tab_block_layout = QVBoxLayout(tab_block)
+    tab_block_layout.setContentsMargins(0, 0, 0, 0)
+    tab_block_layout.setSpacing(0)
+    tab_block_layout.addWidget(tab_strip)
+    tab_block_layout.addWidget(power_row)
+    output_section.pinned.addWidget(tab_block)
 
     # full cards, or compact tiles two to a row: the icon is the one it switches to
     layout_button = make_output_icon_button("", size=OUTPUT_REMOVE_SIZE)
@@ -12049,8 +14775,8 @@ def make_side_panel(on_confirm):
     show_layout_button()
     output_section.pinned.addWidget(add_button)  # stays at the top while the outputs scroll
     output_section.pinned.addWidget(clear_button)
-    output_body.addWidget(pages["output"])
-    output_body.addWidget(pages["generator"])
+    for side in PANEL_TAB_SIDES:   # one list per tab, only the open one shown
+        output_body.addWidget(pages[side])
 
     # bottom half : miner mark and conveyor level, feeding straight into panel_options.
     # Only as tall as its rows, and can be rolled up to its heading alone
@@ -12162,9 +14888,7 @@ def make_side_panel(on_confirm):
         return bool(confirmed) and built_options != options_now()
 
     def card_config(entry):
-        recipe = entry["get_recipe"]()
-        return {"item": entry["item"].full_name, "rate": entry["get_rate"](),
-                "recipe": recipe.full_name if recipe else None, "side": entry["side"]}
+        return saved_card(entry)
 
     def current_config():
         return [card_config(entry) for entry in added_outputs]
@@ -12207,14 +14931,26 @@ def make_side_panel(on_confirm):
             return "clear"   # every output taken off: what it builds is nothing
         # read off what the cards say rather than which card widgets they are:
         # Cancel throws the rows away and makes them again, and those are the
-        # same outputs however new the widgets holding them
-        now = current_config()
-        if now == baseline:
+        # same outputs however new the widgets holding them. A consumer is
+        # a box of the tree like an output: one added or taken off is a new
+        # tree, laid out afresh. Only how many of it stand is read apart -
+        # that changes no box, and only asks for an update.
+        def tree_cards(config):
+            return [card if card.get("side") != "consumer" else {"item": card["item"], "side": "consumer"}
+                    for card in config]
+
+        def consumer_cards(config):
+            return [card for card in config if card.get("side") == "consumer"]
+
+        now_all = current_config()
+        now, built = tree_cards(now_all), tree_cards(baseline)
+        consumers_moved = consumer_cards(now_all) != consumer_cards(baseline)
+        if now == built:
             if panel.recipes_waiting():
                 return "change"
-            return "update" if options_waiting() else "regenerate"
-        if all(card in now for card in baseline):
-            if len(now) == len(baseline):
+            return "update" if options_waiting() or consumers_moved else "regenerate"
+        if all(card in now for card in built):
+            if len(now) == len(built):
                 return "regenerate"   # the same cards, only put in another order
             return "add"     # everything the build had, and more on top of it
         return "generate"
@@ -12229,6 +14965,8 @@ def make_side_panel(on_confirm):
         # it by the stylesheet, and a drawn glyph has to be made again
         confirm_button.setIcon(symbol_icon(BUILD_SYMBOLS[state], accent_shade()))
         confirm_button.setIconSize(QSize(CONFIRM_ICON_SIZE, CONFIRM_ICON_SIZE))
+        confirm_button.setEnabled(not panel_options["locked"])
+        confirm_button.setToolTip(LOCKED_TOOLTIP if panel_options["locked"] else "")
         # nothing changed since the build, nothing to cancel
         undoable = config_changed() and not panel_options["locked"]
         cancel_button.setEnabled(undoable)
@@ -12236,21 +14974,21 @@ def make_side_panel(on_confirm):
         cancel_button.setToolTip(CANCEL_CHANGES_TOOLTIP if undoable else "")
         here = [entry for entry in added_outputs if entry["side"] == current[0]]
         clear_button.setEnabled(bool(here))
-        tab_strip.set_counts([sum(1 for entry in added_outputs if entry["side"] == side)
-                              for side in PANEL_TAB_SIDES])
+        counts = {side: sum(1 for entry in added_outputs if entry["side"] == side) for side in PANEL_TAB_SIDES}
+        tab_strip.set_counts([counts["output"], (counts["generator"], counts["consumer"])])
+        power_strip.set_counts([counts["generator"], counts["consumer"]])
 
     # a locked graph cannot be built again, so the button that would do it is
     # greyed out along with the lists that feed it - what is on the map stays
     # exactly as it is until the lock comes off
     def set_locked(locked):
-        confirm_button.setEnabled(not locked)
         cancel_button.setEnabled(not locked and config_changed())
-        confirm_button.setToolTip(LOCKED_TOOLTIP if locked else "")
         add_button.setEnabled(not locked)
         clear_button.setEnabled(not locked and bool(
             [entry for entry in added_outputs if entry["side"] == current[0]]))
         for entry in added_outputs:
             entry["row"].setEnabled(not locked)
+        refresh_confirm()   # the build button: held by the lock, or by a card's rates
 
     refresh_confirm()   # the button starts with its own word and glyph on it
     set_locked(panel_options["locked"])
@@ -12282,14 +15020,30 @@ def make_side_panel(on_confirm):
     # the cards of a saved project, put back on the lists they were on. Their
     # own recipes are restored with them, rather than the default the picker
     # would hand out, so a project comes back running what it was running.
+    # A project saved when an item made two ways took two cards gets them
+    # back as the one card, both recipes on it.
     def restore_cards(saved):
+        cards = []   # [(item, side, [(recipe, rate)])], in order
         for card in saved:
+            if card.get("side") == "consumer":
+                building = search.All_Power_Buildings.get(card.get("item"))
+                if building is not None:
+                    cards.append((building, "consumer", [(None, card.get("rate") or 0)]))
+                continue
             item = All_Items.get(card.get("item"))
-            recipe = All_Recipes.get(card.get("recipe"))
             if item is None:
                 continue
-            add_card(item, recipe if recipe in item.recipes else None,
-                     card.get("side", "output"), start=card.get("rate"))
+            side = card.get("side", "output")
+            shares = [(recipe if recipe in item.recipes else None, rate) for recipe, rate in card_shares(card)]
+            same = next((made for made in cards if made[0] is item and made[1] == "output"), None)
+            if side == "output" and same is not None:
+                same[2].extend(share for share in shares
+                               if share[0] not in [recipe for recipe, _ in same[2]])
+            else:
+                cards.append((item, side, shares))
+        for item, side, shares in cards:
+            add_card(item, shares[0][0], side, start=sum(rate for _, rate in shares),
+                     shares=shares if len(shares) > 1 else None)
 
     panel.restore_cards = restore_cards
     panel.recipes_waiting = lambda: False   # the canvas hands the real one over
@@ -12307,12 +15061,32 @@ def make_side_panel(on_confirm):
         baseline[:] = current_config()   # what Cancel puts the panel back to
         built_options.clear()
         built_options.update(options_now())
+        # an item made several ways is one output per recipe, each for its
+        # share: the build makes them the one output node
         panel_options["output"] = [
-            {"item": entry["item"], "rate": entry["get_rate"](), "recipe": entry["get_recipe"]()}
-            for entry in added_outputs
+            {"item": entry["item"], "rate": rate, "recipe": recipe}
+            for entry in added_outputs for recipe, rate in entry["get_parts"]()
         ]
+        # the power-only buildings, as the build takes them (see consumer_draw)
+        built_consumers[:] = [(entry["item"], entry["get_rate"]())
+                              for entry in added_outputs if entry["side"] == "consumer"]
         on_confirm(state)
         refresh_confirm()
+        refresh_grid()
+
+    built_consumers = []   # [(PowerBuilding, count)] the last build drew for
+    panel.consumer_draw = lambda: list(built_consumers)
+    panel.grid_power = lambda: 0.0   # the canvas hands over its project's grid (see grid_base)
+
+    # every augmenter card says its boost against the grid as it now stands
+    def refresh_grid():
+        grid = None
+        for entry in added_outputs:
+            if hasattr(entry["row"], "show_boost") and getattr(entry["get_recipe"](), "power_boost", 0):
+                grid = panel.grid_power() if grid is None else grid
+                entry["row"].show_boost(grid)
+
+    panel.refresh_grid = refresh_grid
 
     cancel_button.clicked.connect(cancel_changes)
     confirm_button.clicked.connect(confirm)
@@ -12320,12 +15094,17 @@ def make_side_panel(on_confirm):
     # switching the recipe an output was made with: the card of that item
     # running `was` follows, so map and panel never disagree. A card removed
     # since the last build is left alone.
-    def set_output_recipe(item, was, recipe):
-        entry = next((e for e in confirmed if e in added_outputs
-                      and e["item"] is item and e["get_recipe"]() is was), None)
-        if entry is not None and recipe in item.recipes:
-            entry["row"].combo.setCurrentIndex(item.recipes.index(recipe))
+    def output_card(item, running):
+        return next((e for e in confirmed if e in added_outputs and e["item"] is item
+                     and running in [recipe for recipe, _ in e["get_parts"]()]), None)
 
+    def set_output_recipe(item, was, recipe):
+        entry = output_card(item, was)
+        if entry is not None and recipe in item.recipes:
+            entry["row"].change_part(was, recipe)
+
+    # `recipe` added beside the ones the card of `item` running `beside`
+    # runs, for `share` of all it asks - the others giving that up
     panel.set_output_recipe = set_output_recipe
     return panel, confirm
 
@@ -12405,9 +15184,9 @@ def outputs_from_saved(cards):
         item = POWER_ITEM if POWER_ITEM is not None and name == POWER_ITEM.full_name else All_Items.get(name)
         if item is None:
             continue
-        recipe = All_Recipes.get(card.get("recipe"))
-        outputs.append({"item": item, "rate": card.get("rate") or 0,
-                        "recipe": recipe if recipe in item.recipes else None})
+        for recipe, rate in card_shares(card):
+            outputs.append({"item": item, "rate": rate,
+                            "recipe": recipe if recipe in item.recipes else None})
     return outputs
 
 # The tree a project not opened yet would build: worked out from what it asks
@@ -12419,7 +15198,7 @@ def unloaded_tree(page):
     if not saved.get("built"):
         return None
     options = saved_options()
-    key = json.dumps([saved.get("outputs"), options["miners_mark"],
+    key = json.dumps([saved.get("outputs"), saved.get("pumps"), options["miners_mark"],
                       options["recipe_choices"], options["node_recipe_choices"]], sort_keys=True, default=str)
     if page.home_cache is not None and page.home_cache[0] == key:
         return page.home_cache[1]
@@ -12427,12 +15206,118 @@ def unloaded_tree(page):
         set_miner_mark(panel_options["miners_mark"])
         steps = Node.get_nodes_from_outputs(outputs_from_saved(saved.get("outputs")),
                                             panel_options["recipe_choices"],
-                                            panel_options["node_recipe_choices"])
+                                            panel_options["node_recipe_choices"],
+                                            consumers=consumers_from_saved(saved.get("outputs")))
+        apply_extra(steps, extra_draw([], pumps_from_saved(saved.get("pumps")),
+                                      steps[-1]["links"] if steps else []))
         nodes = steps[-1]["nodes"] if steps else None
     except Exception:
         nodes = None   # a project the data can no longer build still gets its card
     page.home_cache = (key, nodes)
     return nodes
+
+# ---- the grid and what draws on it from outside the tree ----
+#
+# Every project switched on at the hub is on the one power grid: the hub adds
+# their power up (see HomePage). An Alien Power Augmenter adds a share of what
+# that whole grid makes on top of its own (search.power_boost_of), so what it
+# adds is read off the generators of every project on it, not only its own -
+# their own power, before any augmenter adds to it: what one adds is never
+# boosted by another. A project switched off at the hub is a grid of its own.
+# HUB_PAGES[0] hands over every project page, set by the window.
+HUB_PAGES = [lambda: []]
+
+# a project's power node, built or as the hub would build it - None without one
+def project_power_node(page):
+    if page.loaded():
+        steps = getattr(page.view, "build_steps", None)
+        nodes = steps[-1]["nodes"] if steps else None
+    else:
+        nodes = unloaded_tree(page)
+    return next((node for node in nodes or () if is_power_node(node)), None)
+
+# what the generators of the grid `page` is on make, before any boost
+def grid_base(page=None):
+    if page is not None and page.hub_off:
+        power = project_power_node(page)
+        return power.generated if power is not None else 0.0
+    total = 0.0
+    for other in HUB_PAGES[0]():
+        if other.hub_off:
+            continue
+        power = project_power_node(other)
+        if power is not None:
+            total += power.generated
+    return total
+
+# the boost `power`'s augmenters add, worked out against the grid its project
+# is on - and that grid's power, kept on it for what says where the boost comes from
+def apply_boost(power, page):
+    if power is None:
+        return
+    power.grid_base = grid_base(page) if power.boost_fraction > 0 else 0.0
+    power.boost = power.boost_fraction * power.grid_base
+
+# What draws power on a project from outside its tree, as the power node takes
+# it (see search.set_extra_draw): the power-only buildings its Consumer cards
+# ask for, and the pumps along its pipes - only those on a line the build
+# still has. `consumers` is [(PowerBuilding, count)]; `pumps` the project's
+# own ({(mother key, daughter key, item name): [[place, pump name], ...]}).
+def extra_draw(consumers, pumps, links):
+    entries = []
+    for building, count in consumers:
+        if building is not None and count > 0:
+            entries.append({"name": building.display_name, "count": count,
+                            "power": building.power * count, "kind": "consumer", "building": building})
+    lines = {(node_key(mother), node_key(daughter), item.full_name)
+             for mother, daughter, item, _ in links if getattr(item, "is_fluid", False)}
+    counted = {}
+    for key, placed in (pumps or {}).items():
+        if tuple(key) not in lines:
+            continue
+        for pump in placed:
+            building = search.All_Power_Buildings.get(pump[1])
+            if building is not None:
+                counted[building] = counted.get(building, 0) + pump_count(pump)
+    for building in search.pump_buildings():
+        count = counted.get(building, 0)
+        if count:
+            entries.append({"name": building.display_name, "count": count,
+                            "power": building.power * count, "kind": "pump", "building": building})
+    return entries
+
+# That draw put on a finished build: on its power node, made for it if the
+# tree had none, and in what the last step says of it - the step the map
+# shows once a build is done
+def apply_extra(steps, entries):
+    if not steps:
+        return
+    final = steps[-1]
+    nodes = final["nodes"]
+    search.set_extra_draw(nodes, entries)
+    power = next((node for node in nodes if is_power_node(node)), None)
+    if power is not None:
+        final["values"][power] = {"machine_nb": 0, "rate": power.rate, "needed_rate": power.needed_rate}
+
+# a saved project's Consumer cards, read back: [(PowerBuilding, count)]
+def consumers_from_saved(cards):
+    return [(search.All_Power_Buildings.get(card.get("item")), card.get("rate") or 0)
+            for card in cards or () if card.get("side") == "consumer"]
+
+# A pump spot as kept: [place along the line, pump name, how many] - a spot
+# kept before it could hold several being one
+def pump_count(pump):
+    return max(1, int(pump[2])) if len(pump) > 2 else 1
+
+# the pump a new one is: the mark that goes with the pipes the options pick
+def default_pump():
+    pumps = search.pump_buildings()
+    level = int(panel_options.get("pipe_lvl", 1) or 1)
+    return pumps[min(max(level, 1), len(pumps)) - 1]
+
+# a saved project's pumps, read back with their keys as tuples
+def pumps_from_saved(saved):
+    return {tuple(key): [list(pump) for pump in placed] for key, placed in (saved or [])}
 
 # what a card says about its project: what it asks for, whether it has been
 # built, and - if it has - its buildings, its power and how much of it is up
@@ -12444,15 +15329,25 @@ def project_summary(page):
         done = getattr(page.view, "completed", None) or set()
     else:
         saved = page.saved or {}
-        outputs = [(output["item"], output["rate"]) for output in outputs_from_saved(saved.get("outputs"))]
+        # one per card, as an open project's: an item made several ways once
+        outputs = []
+        for output in outputs_from_saved(saved.get("outputs")):
+            same = next((at for at, (item, _) in enumerate(outputs) if item is output["item"]
+                         and item is not POWER_ITEM), None)
+            if same is None:
+                outputs.append((output["item"], output["rate"]))
+            else:
+                outputs[same] = (output["item"], outputs[same][1] + output["rate"])
         nodes = unloaded_tree(page)
         done = set(saved.get("built_nodes") or ())
-    summary = {"outputs": outputs, "built": nodes is not None,
+    summary = {"outputs": [(item, rate) for item, rate in outputs if isinstance(item, search.Item)],
+               "built": nodes is not None,
                "buildings": 0, "made": 0.0, "drawn": 0.0, "done": 0, "total": 0}
     if nodes:
         power = next((node for node in nodes if is_power_node(node)), None)
         if power is not None:
-            summary["made"], summary["drawn"] = power.generated, power.rate
+            apply_boost(power, page)   # what its augmenters add to the grid it is on
+            summary["made"], summary["drawn"] = power.made, power.rate
         summary["buildings"] = round(sum(construction_report(nodes)[0].values()))
         # what can be ticked off as built: a recipe, once, whatever merged into it
         keys = {node_key(node) for node in nodes if isinstance(node, Recipe_Node) and node.merged_into is None}
@@ -12946,6 +15841,7 @@ class HubPower:
     def __init__(self, made, drawn, coordinate=HOME_HUB_SPOT):
         self.coordinate = coordinate
         self.generated = made
+        self.made = made      # what the power box says - every project's boost in it already
         self.rate = drawn
 
 
@@ -13608,48 +16504,138 @@ def make_canvas():
         item_choices, output_choices, replaced = left_panel.recipes.changes()
         panel_options["recipe_choices"].update(item_choices)
         picks = panel_options["node_recipe_choices"]
-        for key, recipe in picks.items():
-            picks[key] = replaced.get(recipe, recipe)
+        for key, pick in picks.items():
+            picks[key] = search.pick_of([(replaced.get(recipe, recipe), share)
+                                         for recipe, share in search.split_of(pick)])
         for (item, was), recipe in output_choices.items():
             side[0].set_output_recipe(item, was, recipe)
 
-    # a recipe picked in one node's info panel: kept for that node alone - the
-    # item made for the machines it feeds - or, on an output's own node, set on
-    # that output's card. Then only that node's subtree is taken out and grown
-    # again, the rest of the tree left where and as it is.
-    def pick_node_recipe(node, recipe):
-        while node.merged_into is not None:
-            node = node.merged_into
+    # The recipe manager's change: `item` made the way `split` says for every
+    # machine inside the tree taking it - kept for each of them, the way a
+    # recipe picked on one node is - and only what that changes grown again.
+    # The manager stays open, reading the new tree.
+    def resplit_item(item, split):
         built = graphics_view.build_steps[-1]["nodes"]
-        outputs = [n for n in built if isinstance(n, Output_Node) and not n.is_byproduct]
-        made = [entry["item"] for entry in recipe.products]
-        for mother in node.mother_nodes:
-            # only what the new recipe makes follows it here; anything else the
-            # node supplied is made again by its own item's recipe
-            taken = next((entry["item"] for entry in node.products if mother in entry["to"]), node.needed_item)
-            if taken not in made:
-                continue
-            if mother in outputs:
-                side[0].set_output_recipe(taken, node.recipe, recipe)
-                for output in panel_options["output"]:
-                    if output["item"] is taken and output.get("recipe") is node.recipe:
-                        output["recipe"] = recipe
-                        break
-            elif isinstance(mother, Recipe_Node):
-                panel_options["node_recipe_choices"][(taken, mother.recipe)] = recipe
-        # rebuilt once the dropdown's own list has closed
-        QTimer.singleShot(0, lambda: rebuild_node(node, recipe))
-
-    def rebuild_node(node, recipe):
-        built = graphics_view.build_steps[-1]["nodes"]
-        if node not in built:
+        takers = search.inner_supply(built, item)
+        if not takers or panel_options["locked"]:
             return
+        pick = search.pick_of(split)
+        for mother, _ in takers:
+            panel_options["node_recipe_choices"][(item, mother.recipe)] = pick
+        anchor = next(iter(takers[0][1])).coordinate
+        # the info panel the manager is bolted to, as it stood: a rebuild
+        # draws the map again, and the panel goes with the old one
+        opened_on = getattr(graphics_view, "info_node", lambda: None)()
+        spot = graphics_view.info_panel.pos() if opened_on is not None and graphics_view.info_was_dragged() else None
+        rebuild_around(anchor, lambda: Node.resplit(
+            built, item, split, panel_options["recipe_choices"], panel_options["node_recipe_choices"]))
+        # ...opened again where it was, on the same box - or, gone, on another
+        # making the item - once the map shows the finished tree. A build
+        # being played through shows no panel: the manager stays put meanwhile.
+        steps = graphics_view.build_steps
+        if opened_on is not None and graphics_view.build_step == len(steps) - 1:
+            final = steps[-1]["nodes"]
+            if opened_on not in final:
+                opened_on = next((supplier for _, suppliers in search.inner_supply(final, item)
+                                  for supplier in suppliers), None)
+            if opened_on is not None:
+                graphics_view.open_node_info(opened_on, spot)
+        recipe_manager.follow()
+        manager_shown(not recipe_manager.isHidden())
+        schedule_save()
+
+    # The manager is bolted to the node's info panel: its button opens it and
+    # shuts it, it shuts with the panel, and a panel opened on a box making
+    # another item shuts it too - one making the same item keeps it.
+    # What draws power on this project from outside its tree, for the steps a
+    # build just made (see extra_draw): the Consumer cards as built, and the
+    # pumps on the pipes the build still has
+    def project_extra(steps):
+        # the consumers are nodes of the tree (see Consumer_Node): only the pumps are extra
+        return extra_draw([], getattr(graphics_view, "pumps", {}), steps[-1]["links"] if steps else [])
+
+    # A pump put on a pipe, changed, moved or taken off: what the pumps draw
+    # goes on the power node straight away - the tree is not built again for
+    # it - and the map is drawn again where it stands
+    def pumps_changed():
+        steps = getattr(graphics_view, "build_steps", None)
+        if steps:
+            apply_extra(steps, project_extra(steps))
+            redraw_graph()
+        schedule_save()
+        window = graphics_view.window()
+        home = getattr(getattr(window, "project_tabs", None), "home_page", None)
+        if home is not None:
+            home.refresh_soon()   # its card's power, and the grid's
+
+    graphics_view.on_pumps_changed = pumps_changed
+
+    recipe_manager = make_recipe_manager(graphics_view)
+    recipe_manager.on_apply = resplit_item
+    graphics_view.on_info_panel_moved = recipe_manager.follow
+
+    def toggle_manager(node, item):
+        if recipe_manager.item() is item and not recipe_manager.isHidden():
+            recipe_manager.close_manager()
+        else:
+            recipe_manager.show_item(item, graphics_view.build_steps[-1]["nodes"])
+
+    def info_opened(node):
+        if recipe_manager.item() is not None and managed_item(node) is not recipe_manager.item():
+            recipe_manager.close_manager()
+
+    def manager_shown(on):
+        info = getattr(graphics_view, "info_panel", None)
+        try:
+            if info is not None:
+                info.show_manager_open(on)
+        except RuntimeError:
+            pass   # the panel of a scene drawn over since
+
+    # its tab, at the info panel's side: pulls it out on the item of the box
+    # the panel stands open on, or pushes it back in
+    def tab_clicked():
+        if recipe_manager.item() is not None:
+            recipe_manager.close_manager()
+            return
+        node = getattr(graphics_view, "info_node", lambda: None)()
+        item = managed_item(node) if node is not None else None
+        if item is not None:
+            recipe_manager.show_item(item, graphics_view.build_steps[-1]["nodes"])
+
+    recipe_manager.on_tab = tab_clicked
+    graphics_view.on_node_recipe_manage = toggle_manager
+    graphics_view.on_info_opened = info_opened
+    # the info panel shut: the manager pushed back in, and its tab gone with
+    # the panel - shut or not, the tab has to be laid out again
+    # drawing back toward its box, the panel takes the manager with it
+    def info_closed():
+        if getattr(graphics_view, "info_closing", None) is not None:
+            recipe_manager.fold_away(INFO_RETRACT_MS)
+        else:
+            recipe_manager.close_manager()
+        recipe_manager.follow()
+
+    graphics_view.on_info_closed = info_closed
+    graphics_view.manager_is_out = lambda: recipe_manager.item() is not None and not recipe_manager.isHidden()
+    graphics_view.manager_open_for = lambda item: recipe_manager.item() is item and not recipe_manager.isHidden()
+    recipe_manager.on_shown = manager_shown
+
+    # whatever a build left on the map, read again by the panels reporting on it
+    def report(nodes):
+        left_panel.show_report(nodes)
+        recipe_manager.refresh(nodes)
+
+    # The tree changed in one place - `make_steps` hands the steps from the
+    # tree as it stands to the new one - and drawn again around `anchor`:
+    # every box still there stays put, what is new is laid out about it.
+    def rebuild_around(anchor, make_steps):
+        built = graphics_view.build_steps[-1]["nodes"]
         match_compact()   # what stays and what is new, laid out at one spacing
         kept = {n: n.coordinate for n in built}
-        anchor = node.coordinate
         set_miner_mark(panel_options["miners_mark"])
-        steps, _ = Node.rebuild_subtree(built, node, recipe, panel_options["recipe_choices"],
-                                        panel_options["node_recipe_choices"])
+        steps = make_steps()
+        apply_extra(steps, project_extra(steps))   # a pump on a line gone is drawn no more
         layout_nodes(steps, kept, anchor)
         graphics_view.laid_compact = panel_options["compact"]
         reveal = panel_options["build_reveal"]
@@ -13657,13 +16643,12 @@ def make_canvas():
         graphics_view.build_step = len(steps) - 1 if reveal == "skip" else 0
         # the camera stays put: the tree around the change has not moved
         transition_scene(graphics_view, render_build_step(graphics_view))
-        left_panel.show_report(steps[-1]["nodes"])
+        report(steps[-1]["nodes"])
         if step_bar[0] is not None:
             step_bar[0].refresh()
             if reveal == "play":
                 step_bar[0].play_from_start()
 
-    graphics_view.on_node_recipe = pick_node_recipe
 
     # its pages report on every confirmed build; a recipe picked there waits
     # for the build button, which says "Change" meanwhile
@@ -13685,7 +16670,9 @@ def make_canvas():
         spots = node_positions(steps[-1]["nodes"])
         set_miner_mark(panel_options["miners_mark"])
         steps = Node.get_nodes_from_outputs(panel_options["output"], panel_options["recipe_choices"],
-                                            panel_options["node_recipe_choices"])
+                                            panel_options["node_recipe_choices"],
+                                            consumers=side[0].consumer_draw())
+        apply_extra(steps, project_extra(steps))
         layout_nodes(steps)   # a spot for anything new, before the old ones go back
         apply_positions(steps[-1]["nodes"], spots)
         graphics_view.laid_compact = panel_options["compact"]
@@ -13698,7 +16685,7 @@ def make_canvas():
         horizontal.setValue(offset_x)
         vertical.setValue(offset_y)
         graphics_view.notify_view_changed()
-        left_panel.show_report(steps[-1]["nodes"])
+        report(steps[-1]["nodes"])
         match_panel_order()
         if step_bar[0] is not None:
             step_bar[0].refresh()
@@ -13708,6 +16695,12 @@ def make_canvas():
         if state == "update":
             update_graph()
             return
+        # Regenerating starts the inner recipes over: every box inside the
+        # tree back on its item's own recipe - the one the Recipes page picked
+        # for it, else the default - whatever was picked or shared out on the
+        # map since. The outputs keep the recipes their cards say.
+        if state == "regenerate":
+            panel_options["node_recipe_choices"].clear()
         confirm_fresh()
 
     # The panel's cards in the order the tree shows them: top to bottom, as
@@ -13754,13 +16747,14 @@ def make_canvas():
         # crossings of the same outputs generated from scratch - so the same
         # outputs read differently depending on whether they were added one at
         # a time or built in one go. Picking a recipe on a node still moves
-        # nothing but its own subtree (see rebuild_node): that is a change to
+        # nothing but its own subtree (see rebuild_around): that is a change to
         # one part of a tree, not a new tree.
         scene = generate_node_graph(graphics_view, panel_options["output"],
-                                    step=-1 if reveal == "skip" else 0)
+                                    step=-1 if reveal == "skip" else 0, extra=project_extra,
+                                    consumers=side[0].consumer_draw())
         transition_scene(graphics_view, scene)
         fit_view_to_rect(graphics_view, build_steps_bounds(graphics_view.build_steps), animate=True)
-        left_panel.show_report(graphics_view.build_steps[-1]["nodes"])   # what the finished factory costs
+        report(graphics_view.build_steps[-1]["nodes"])   # what the finished factory costs
         match_panel_order()
         if step_bar[0] is not None:
             step_bar[0].refresh()
@@ -13775,6 +16769,8 @@ def make_canvas():
     panel.recipes_waiting = left_panel.recipes.waiting   # what the button reads to say "Change"
     panel.discard_recipes = left_panel.recipes.discard   # ...and what Cancel puts back
     panel.before_build = take_recipe_picks               # and takes in as it builds
+    # the grid this project is on, for its augmenter cards (see grid_base)
+    panel.grid_power = lambda: grid_base(getattr(graphics_view, "project_page", None))
 
     # an arrow-mode switch only needs the existing graph redrawn in the new
     # style - reusing the same Node objects (and so every dragged position)
@@ -13895,6 +16891,9 @@ def make_canvas():
             side[0].set_locked(locked)
             if getattr(graphics_view, "info_panel", None) is not None:
                 graphics_view.info_panel.refresh()   # its recipe row greys with it
+        steps = getattr(graphics_view, "build_steps", None)
+        if steps:
+            recipe_manager.refresh(steps[-1]["nodes"])   # ...and the recipe manager's lines
 
     # Every graph option as it now stands, on this project's graph and its
     # option bar - run whenever the project is opened. The options are the
@@ -14069,6 +17068,22 @@ def make_canvas():
     container.panel = panel
     container.match_compact = match_compact
     container.sync_view_options = sync_view_options
+
+    # What this project's augmenters add, read against the grid as it is now:
+    # another project built or switched off since moves it. The map is only
+    # drawn again when the boost it shows has moved.
+    def refresh_grid():
+        side[0].refresh_grid()
+        steps = getattr(graphics_view, "build_steps", None)
+        power = next((node for node in steps[-1]["nodes"] if is_power_node(node)), None) if steps else None
+        if power is None or power.boost_fraction <= 0:
+            return
+        shown = power.boost
+        apply_boost(power, getattr(graphics_view, "project_page", None))
+        if abs(power.boost - shown) > 1e-6:
+            redraw_graph()
+
+    container.refresh_grid = refresh_grid
     container.hold_panel_order = lambda held: panel_order_held.__setitem__(0, held)
     # the panel's own confirm, not the canvas': it reads the cards into
     # panel_options["output"] first, which is what the build actually goes on
@@ -14268,6 +17283,7 @@ class ProjectPage(QWidget):
 
     def lay_out_canvas(self):
         self.canvas = make_canvas()
+        self.canvas.view.project_page = self   # the grid its augmenters boost (see grid_base)
         self.layout().addWidget(self.canvas)
         self.layout().activate()
         self.canvas.show()
@@ -14275,8 +17291,10 @@ class ProjectPage(QWidget):
 
     def put_back_cards(self, project):
         self.panel.restore_cards(project.get("outputs", []))
-        # set before the build: the boxes come up already ticked off
+        # set before the build: the boxes come up already ticked off, the
+        # pipes with their pumps on
         self.view.completed = set(project.get("built_nodes") or ())
+        self.view.pumps = pumps_from_saved(project.get("pumps"))
 
     def put_back_build(self, project):
         if not project.get("built"):
@@ -14628,6 +17646,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
+        HUB_PAGES[0] = lambda: self.project_pages()   # the grid is every project on the hub
         self.setWindowIcon(app_icon())
         # the options are read before anything is built: every panel and every
         # graph is drawn from them
