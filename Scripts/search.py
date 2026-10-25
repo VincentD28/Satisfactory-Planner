@@ -2,11 +2,17 @@
 # Date        : 12-08-2026
 
 # todo : 
-#      : being able to edit the number and overclock of the machines of a node in the graph
-#      : being able to specify the level/number/overclock/purity/separation of an extraction node
-#      :
-#      :
-#      :
+#      : 
+#      : 
+#      : 
+#      : brighter on off button
+#      : consistent progress bar size
+#      : thiner type nodes + bigger text
+#      : arrow in hub for output to proj input (for proj input, show all the needed input even before linking them)
+#      : cant complete a output node
+#      : bug with recipe manager, changing a recipe just add it, not change it
+#      : ressource nodes in proj + linking in hub or proj
+#      : upgrade bar for instance nodes (rectangular stop for the right of progress bar,at the top, write the name : mk1, mk2, mk3 and at the bottom, the rate, only show the rate of the current bar max, make the info at the top of the instance always fit (ex.: Normal, Miner Mk.1, 100%), not able to change the linking in the instance)
 #      : map to connect input for project to the the nodes they are extraction (keeping track of the usage of each nodes)
 
 #      : x Alien Power Augmenter as a generator (plain, or burning Alien Power Matrix): 500 MW each + 10% / 30% of the whole hub grid's power, the grid power going in shown on its card, its node's panel and the power node
@@ -140,6 +146,18 @@ MINER_MARK = 1
 def set_miner_mark(mark):
     global MINER_MARK
     MINER_MARK = mark
+
+# The resource nodes the project being built has assigned to what it digs
+# out, by item: [(extractor, rate it gives, rate it gives at 100% clock)], in
+# the order they are filled. An extraction box of one of them stands its
+# machines on those nodes - one extractor a node - rather than counting
+# miners on normal nodes (see Recipe_Node.stand_on_sites). Set by the planner
+# before every build.
+EXTRACTION_SITES = {}
+
+def set_extraction_sites(sites):
+    global EXTRACTION_SITES
+    EXTRACTION_SITES = sites or {}
 
 
 def load_data():
@@ -1433,6 +1451,39 @@ class Recipe_Node(Node):
         product = next(p for p in self.recipe.products if p["item"] == item)
         return rate / (product["amount"] / self.duration * 60)
 
+    # An extraction on assigned resource nodes: what it is asked for poured
+    # into them in their order, each full before the next, one extractor on
+    # every node it reaches - clocked to what it gives there. Whatever they
+    # cannot give is left to the planner's own miners, counted as before.
+    # The machine it shows is the one most of those nodes carry.
+    def stand_on_sites(self):
+        sites = EXTRACTION_SITES.get(self.needed_item) if not self.recipe.ingredients else None
+        self.on_sites = bool(sites)   # its power then read off its clocks, not its count
+        if not sites:
+            return
+        left, used, power = self.needed_rate, [], 0.0
+        for machine, capacity, base in sites:
+            if left <= 1e-9:
+                break
+            poured = min(left, capacity)
+            if poured <= 0:
+                continue
+            left -= poured
+            used.append(machine)
+            draw = self.recipe.average_power or machine.power_consuption
+            power += draw * (poured / base) ** Machine.POWER_EXPONENT if base else 0.0
+        extra = self.machines_for(self.needed_item, left) if left > 1e-9 else 0.0
+        if extra:
+            power += power_for(self, extra)
+        if used:
+            self.machine = max(set(used), key=used.count)
+            self.machine_picture = self.machine.picture
+        self.machine_nb = len(used) + extra
+        self.full_machines = int(self.machine_nb)
+        self.last_machine_clock = self.machine_nb - self.full_machines
+        self.machine_built = self.full_machines + (1 if self.last_machine_clock else 0)
+        self.needed_power = power
+
     # what every product is asked for, read off the repartition on it
     # byproducts only take what is left over, they never ask for more
     # - and neither do the takers drawing only on its leftovers
@@ -1475,6 +1526,7 @@ class Recipe_Node(Node):
         self.last_machine_clock = self.machine_nb - self.full_machines
         self.machine_built = self.full_machines + (1 if self.last_machine_clock else 0)
         self.needed_power = power_for(self, self.machine_nb)
+        self.stand_on_sites()
 
         # the power it draws is an ingredient like any other, so the graph can
         # carry a line from the power node into it (see refresh_power). It is

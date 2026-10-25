@@ -5,6 +5,7 @@ import json
 import math
 import time
 import html
+import uuid
 import ast
 import operator
 from PySide6.QtWidgets import (
@@ -12,7 +13,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTabWidget, QTabBar, QPushButton,
     QLineEdit, QListWidget, QListWidgetItem, QStackedWidget, QGraphicsOpacityEffect, QScrollArea,
     QToolButton,
-    QGraphicsItem, QGraphicsRectItem, QGraphicsTextItem, QGraphicsPixmapItem, QGraphicsPathItem,
+    QGraphicsItem, QGraphicsRectItem, QGraphicsTextItem, QGraphicsPixmapItem, QGraphicsPathItem, QGraphicsProxyWidget,
     QAbstractScrollArea, QAbstractButton,
     QGraphicsPolygonItem, QComboBox, QGraphicsDropShadowEffect, QSlider, QSizePolicy, QStyledItemDelegate,
     QGridLayout, QMenu, QStyle, QStyleOption, QFrame
@@ -361,6 +362,11 @@ APPDATA_SAVE_DELAY = 700   # ms of quiet before a change is written out
 # run by one node (they merge), an output is its item, and a hand source the
 # item it brings in - and the same key twice over is numbered, so two outputs
 # of one item keep their own spots.
+# what can be ticked off as built: not the power node, the factory's own
+# tally, nor an output or something brought in by hand - neither is put up
+def can_be_built(node):
+    return not is_power_node(node) and not isinstance(node, (Output_Node, Manual_Node, search.Source_Node))
+
 def node_key(node):
     if is_power_node(node):
         return "power"
@@ -368,6 +374,8 @@ def node_key(node):
         return f"consumer:{node.building.full_name}"
     if isinstance(node, Recipe_Node):
         return f"recipe:{node.recipe.full_name}"
+    if isinstance(node, search.Source_Node):
+        return f"resource_source:{node.item.full_name}"
     item = getattr(node, "item", None)
     name = item.full_name if item is not None else "?"
     if isinstance(node, Output_Node):
@@ -471,12 +479,12 @@ def card_shares(card):
 def saved_project(page):
     if not page.loaded():
         return {**page.saved, "name": page.project_name, "color": page.tab_color, "tab_page": page.tab_page,
-                "compact": page.compact, "hub_off": page.hub_off}
+                "compact": page.compact, "hub_off": page.hub_off, "uid": page.uid}
     cards = [saved_card(entry) for entry in page.panel.cards()]
     view = page.view
     steps = getattr(view, "build_steps", None)
     project = {"name": page.project_name, "color": page.tab_color, "tab_page": page.tab_page,
-               "compact": page.compact, "hub_off": page.hub_off,
+               "compact": page.compact, "hub_off": page.hub_off, "uid": page.uid,
                "outputs": cards, "built": bool(steps)}
     if steps:
         project["positions"] = node_positions(steps[-1]["nodes"])
@@ -504,7 +512,8 @@ def save_appdata(window):
                 "window": [window.width(), window.height()],
                 "current": window.current_project(),
                 "projects": [saved_project(page) for page in pages],
-                "tab_pages": window.project_tabs.page_count()}
+                "tab_pages": window.project_tabs.page_count(),
+                "resources": saved_resources()}
         # written whole to a file of its own, then swapped in: a save cut off
         # halfway leaves the old file standing rather than half of a new one
         partial = APPDATA_FILE + ".tmp"
@@ -572,7 +581,7 @@ TAB_SYMBOL_HOVER_COLOR = TEXT_NORMAL
 TAB_SYMBOL_HOVER_BG = "rgba(255, 255, 255, 0.12)"
 TAB_SYMBOL_PRESS_BG = "rgba(0, 0, 0, 0.18)"        # flat buttons, darkened while held down
 ACCENT_PRESS_BG = ACCENT_SHADES["blue"]["press"]   # filled accent buttons, darkened while held down
-TAB_PRESS_OVERLAY = (0, 0, 0, 90)                  # RGBA painted over a held down tab
+TAB_PRESS_OVERLAY = (0, 0, 0, 55)                  # RGBA painted over a held down tab: a soft dip
 CLOSE_BUTTON_MARGIN = 8  # spacing on both sides of the "-" button
 CLOSE_BUTTON_HOVER_BG = "rgba(255, 255, 255, 0.3)"  # stronger than the tab's own hover, so it stands out
 CLOSE_BUTTON_HOVER_COLOR = TEXT_STRONG
@@ -590,7 +599,7 @@ TAB_OPEN_BG = "#2a2a2a"             # the right panel's own ground (PANEL_BG)
 TAB_HOVER_BG = "rgba(255, 255, 255, 0.05)"
 # the tab under the mouse, washed over its own ground - whatever that ground
 # is: the row's, a closed tab's, or the open tab's own color
-TAB_HOVER_OVERLAY = (255, 255, 255, 22)   # RGBA
+TAB_HOVER_OVERLAY = (255, 255, 255, 16)   # RGBA: a soft light over a tab under the mouse
 TAB_TOP_GAP = 10                    # the row's ground left showing over each tab
 TAB_SELECTED_TOP_GAP = TAB_TOP_GAP  # the open tab stands no taller
 # The open tab stands taller than the rest, and that is what is eased when
@@ -786,7 +795,9 @@ class HomeColumn(QWidget):
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.fillRect(self.rect(), QColor(TAB_BAR_BG))   # the floors' own ground round it
+        # the column itself; past it, the strip its foot reaches out over
+        body = self.width() - TAB_FOOT_RADIUS
+        painter.fillRect(QRectF(0, 0, body, self.height()), QColor(TAB_BAR_BG))   # the floors' own ground round it
         gap = bar.top_gap(index)
         # a line down its right side, a little clear of it: home on one
         # side, the pages' rows on the other - fading out towards its top
@@ -800,7 +811,7 @@ class HomeColumn(QWidget):
         fade.setColorAt(1.0, clear)
         # as much air either side of it: the tabs past the column stand 1px
         # in from its edge, as every tab does from its own
-        wall = self.width() - HOME_COLUMN_WALL_GAP
+        wall = body - HOME_COLUMN_WALL_GAP
         painter.fillRect(QRectF(wall, gap, 1, self.height() - gap), QBrush(fade))
         shape = tab_shape_of(QRectF(1, gap, wall - HOME_COLUMN_WALL_GAP - 1, self.height() - gap))
         painter.fillPath(shape, QColor(bar.tab_ground(index)))
@@ -812,10 +823,31 @@ class HomeColumn(QWidget):
             filling.addRect(QRectF(box.left(), box.top(), box.width(), box.height() * spread))
             fill_under_line(painter, shape.intersected(filling), shape, tab_line_of(shape.boundingRect()), color)
         painter.fillPath(tab_line_of(shape.boundingRect()), color)
-        if self.hovered:
+        # open, its foot on the bottom row alone - where the column meets the
+        # band under the rows - and only on its right, the window's edge on its left
+        if spread > 0:
+            painter.fillPath(tab_feet_of(shape.boundingRect(), TAB_FOOT_RADIUS * spread, left_foot=False),
+                             color if spread >= 1 else QColor(bar.tab_ground(index)))
+        if self.hovered and spread < 1:
             painter.fillPath(shape, QColor(*TAB_HOVER_OVERLAY))
         if self.pressed:
             painter.fillPath(shape, QColor(*TAB_PRESS_OVERLAY))
+        # The first tab past it, open on the bottom floor: its left foot runs
+        # in under this column's foot, where the row cannot draw it - the
+        # column stands over that part of the row. On a floor with others
+        # under it, the column runs on down past it, and it has none.
+        first = next((at for at in range(index + 1, bar.count())
+                      if bar.isTabVisible(at) and bar.tab_key(at) is not None), None)
+        if (first is not None and first == bar.currentIndex() and not getattr(bar, "has_rows_below", False)
+                and bar.grown(first) > 0):
+            grown = bar.grown(first)
+            # through the screen: the row is not inside this column, so it
+            # cannot be mapped to it directly
+            corner = QPointF(self.mapFromGlobal(bar.mapToGlobal(QPoint(0, 0))))
+            foot = tab_feet_of(bar.tab_shape(first).boundingRect().translated(corner),
+                               TAB_FOOT_RADIUS * grown, right_foot=False)
+            tint = QColor(bar.tab_colors.get(bar.tab_key(first), TAB_DEFAULT_COLOR))
+            painter.fillPath(foot, tint if grown >= 1 else QColor(bar.tab_ground(first)))
         lit = index == bar.currentIndex() or self.hovered
         middle = shape.boundingRect().center()
         painter.translate(middle.x() - HOME_ICON_SIZE / 2, middle.y() - HOME_ICON_SIZE / 2)
@@ -909,6 +941,35 @@ def _tab_path(kind, rect, make):
 
 def tab_shape_of(rect):
     return _tab_path("shape", rect, _tab_shape_at)
+
+TAB_FOOT_RADIUS = TAB_CORNER_RADIUS   # how far the open tab's feet reach out (see tab_feet_of):
+                                      # the same curve as its top corners
+TAB_HOVER_FADE_MS = 140    # a tab's light coming up under the mouse, and going again (see note_hover)
+
+# The open tab's feet: at both of its bottom corners the tab flares out into
+# the row, a hollow curve sweeping down from its side onto the band under the
+# row - the way a browser's open tab runs into its page. `size` is how far
+# out they reach, 0 for none.
+# `left_foot` off leaves out the left one: the open tab standing first after
+# home's column, which draws that foot itself (see HomeColumn).
+def tab_feet_of(rect, size, left_foot=True, right_foot=True):
+    feet = QPainterPath()
+    if size <= 0:
+        return feet
+    left, right, bottom = rect.left(), rect.right(), rect.bottom()
+    if left_foot:
+        feet.moveTo(left, bottom - size)
+        feet.lineTo(left, bottom)
+        feet.lineTo(left - size, bottom)
+        feet.arcTo(QRectF(left - 2 * size, bottom - 2 * size, 2 * size, 2 * size), 270, 90)
+        feet.closeSubpath()
+    if right_foot:
+        feet.moveTo(right, bottom - size)
+        feet.lineTo(right, bottom)
+        feet.lineTo(right + size, bottom)
+        feet.arcTo(QRectF(right, bottom - 2 * size, 2 * size, 2 * size), 270, -90)
+        feet.closeSubpath()
+    return feet
 
 # A tab's color filling it from its line down. The fill and the line meet on
 # the curve of its corners, where both have soft edges: laid one on the
@@ -1191,7 +1252,7 @@ class ReleaseTabBar(QTabBar):
                     break
         event.accept()
 
-    # ---- selection on release, dragging to reorder ----
+    # ---- selection on press, dragging to reorder ----
 
     # a project tab can be dragged along the row; home stays first and the
     # "+" last, and neither is ever passed over
@@ -1207,6 +1268,14 @@ class ReleaseTabBar(QTabBar):
         self.press_x = event.position().x()
         self.press_point = event.position().toPoint()   # a floor drag goes any way
         self.dragging = False
+        # Opened the moment it is pressed, as a browser's tab is - a drag
+        # carries on from there all the same. The "+" waits for its release,
+        # as a button does; and so does a floor's tab, whose pick builds the
+        # floors again under the press (see mouseReleaseEvent).
+        index = self.pressed_on
+        if (event.button() == Qt.LeftButton and self.on_pick is None
+                and self.tab_key(index) is not None and index != self.currentIndex()):
+            self.setCurrentIndex(index)
         self.update()
         event.accept()
 
@@ -1304,12 +1373,68 @@ class ReleaseTabBar(QTabBar):
         slide.finished.connect(landed)
         run(slide)
 
-    # the tab under the mouse: drawn again only when it changes
+    # the tab under the mouse: drawn again only when it changes. Its light
+    # fades in, and the one it left fades out (see hover_level).
     def note_hover(self, point):
         index = self.tabAt(point) if point is not None else -1
-        if index != getattr(self, "hovered", -1):
-            self.hovered = index
+        was = getattr(self, "hovered", -1)
+        if index == was:
+            return
+        self.hovered = index
+        for at, target in ((was, 0.0), (index, 1.0)):
+            if 0 <= at < self.count():
+                self.fade_hover(self.hover_key(at), target)
+        self.update()
+
+    # whether the tab at `index` is the first one shown after home's
+    def first_after_home(self, index):
+        for before in range(index - 1, -1, -1):
+            if self.isTabVisible(before) and self.tabRect(before).width() > 0:
+                return self.tab_key(before) == HOME_TAB_KEY
+        return True
+
+    # what a tab's light is kept by: its key, or the "+" for the button
+    def hover_key(self, index):
+        key = self.tab_key(index)
+        return "plus" if key is None else key
+
+    # how far its light has come up, 0 to 1
+    def hover_level(self, index):
+        return getattr(self, "hover_levels", {}).get(self.hover_key(index), 0.0)
+
+    def fade_hover(self, key, target):
+        levels = self.__dict__.setdefault("hover_levels", {})
+        fades = self.__dict__.setdefault("hover_fades", {})
+        running = fades.pop(key, None)
+        if running is not None:
+            try:
+                running.stop()
+            except RuntimeError:
+                pass
+
+        def step(value, key=key):
+            levels[key] = float(value)
             self.update()
+
+        def done(key=key):
+            fades.pop(key, None)
+            if levels.get(key, 0.0) <= 0.0:
+                levels.pop(key, None)
+
+        animation = animate_value(self, levels.get(key, 0.0), target, step, TAB_HOVER_FADE_MS)
+        animation.finished.connect(done)
+        fades[key] = animation
+
+    # the light over tab `index`, as far as it has come up: over the whole
+    # of its shape, laid with the grounds - so the open tab's feet, laid after
+    # every ground, stand over it rather than under it
+    def paint_hover(self, painter, index):
+        level = self.hover_level(index)
+        if level <= 0 or getattr(self, "dragging", False):
+            return
+        light = QColor(*TAB_HOVER_OVERLAY)
+        light.setAlpha(round(TAB_HOVER_OVERLAY[3] * level))
+        painter.fillPath(self.tab_shape(index), light)
 
     def leaveEvent(self, event):
         self.note_hover(None)
@@ -1481,12 +1606,20 @@ class ReleaseTabBar(QTabBar):
         # for every tab, and each of these carries its project's color
         grounds = QPainter(self)
         grounds.setRenderHint(QPainter.Antialiasing)
+        feet = []
         for index in range(self.count()):
             if self.tab_key(index) is None:
-                continue        # the "+" is a button, and stands on the bar itself
+                # the "+" is a button, and stands on the bar itself - its
+                # light the only thing drawn for it
+                self.paint_hover(grounds, index)
+                continue
             if not self.isTabVisible(index):
                 continue        # on another page: Qt leaves it no place, and its
                                 # shape would be drawn in the corner over home
+            if self.tabRect(index).width() < 2 * TAB_CORNER_RADIUS + 2:
+                continue        # sliding open or shut, narrower than its own two
+                                # corners: its line and its feet folded into a
+                                # little fork between its neighbours
             grounds.fillPath(self.tab_shape(index), QColor(self.tab_ground(index)))
             color = QColor(self.tab_colors.get(self.tab_key(index), TAB_DEFAULT_COLOR))
             # a tab picked fills with its own color from that line down, so
@@ -1503,9 +1636,30 @@ class ReleaseTabBar(QTabBar):
             # the accent used to mark whichever tab was open - the tab's own
             # rounded corners are all that shape it
             grounds.fillPath(self.tab_line(index), color)
-            # under the mouse: a light wash over all of it, open or not
-            if index == getattr(self, "hovered", -1) and not getattr(self, "dragging", False):
-                grounds.fillPath(self.tab_shape(index), QColor(*TAB_HOVER_OVERLAY))
+            # the open one's feet, in the color its foot is filled with: they
+            # grow out as it opens and draw back in as another is picked.
+            # Laid after every tab's ground, which they reach out over.
+            # (home's own, while it stands as a column through every floor:
+            # the column draws its foot, on the bottom one - and none while a
+            # tab is carried along the row, the open one's place left behind it)
+            if (spread > 0 and not getattr(self, "dragging", False)
+                    and not (self.tab_key(index) == HOME_TAB_KEY and getattr(self, "home_column_shown", False))):
+                # the first after home leaves its left foot to home's column,
+                # while there is one: it stands over that part of the row
+                column = getattr(self, "home_column_shown", False)
+                feet.append((tab_feet_of(self.tab_shape(index).boundingRect(), TAB_FOOT_RADIUS * spread,
+                                         left_foot=not (column and self.first_after_home(index))),
+                             color if spread >= 1 else QColor(self.tab_ground(index))))
+            # under the mouse: a soft light over it - not on the open one,
+            # which stands lit already
+            if spread < 1:
+                self.paint_hover(grounds, index)
+        for path, color in feet:
+            grounds.fillPath(path, color)
+        # kept for the press's shade, which stops short of them
+        self.feet_drawn = QPainterPath()
+        for path, _ in feet:
+            self.feet_drawn = self.feet_drawn.united(path)
         grounds.end()
 
         super().paintEvent(event)
@@ -1534,7 +1688,9 @@ class ReleaseTabBar(QTabBar):
         if self.pressed_on != -1 and not self.grabbing:
             # over the tab's own shape, rounded top and all
             painter.setRenderHint(QPainter.Antialiasing)
-            painter.fillPath(self.tab_shape(self.pressed_on), QColor(*TAB_PRESS_OVERLAY))
+            # ...less the open tab's feet, which reach in over a tab beside it
+            shade = self.tab_shape(self.pressed_on).subtracted(getattr(self, "feet_drawn", QPainterPath()))
+            painter.fillPath(shade, QColor(*TAB_PRESS_OVERLAY))
         # a tab a picture stands in for: its place left as the row's ground
         for key in self.masked:
             index = self.index_of(key)
@@ -1879,9 +2035,6 @@ def make_project_tabs():
         "QTabBar::tab:!selected {"
         f"  color: {TAB_UNSELECTED_COLOR};"
         "}"
-        "QTabBar::tab:hover {"
-        f"  background: {TAB_HOVER_BG};"
-        "}"
         "QTabBar::tab:hover:!selected {"
         f"  color: {TAB_SYMBOL_HOVER_COLOR};"
         "}"
@@ -2034,6 +2187,12 @@ def make_project_tabs():
         bar.tab_colors[project_count[0]] = page.tab_color
         if not select:
             refresh_pages()
+            if saved is None:
+                # a new one all the same, only not opened: its tab slides in
+                # beside the others, and its card on the hub
+                bar.slide_tab_open(project_count[0])
+                schedule_save()
+                home_page.refresh_soon()
             return page
         bar.slide_tab_open(project_count[0])
         tabs.setCurrentIndex(index)
@@ -2538,7 +2697,7 @@ def make_project_tabs():
     tabs.tabBar().tab_colors[HOME_TAB_KEY] = TAB_DEFAULT_COLOR
     tabs.setTabToolTip(home_index, "Home")
     home_page.tabs = tabs
-    home_page.new_project = lambda: add_project_tab()
+    home_page.new_project = lambda: add_project_tab(rename=False, select=False)   # the hub stays shown
 
     empty_state = QWidget()
     empty_state.setAttribute(Qt.WA_StyledBackground, True)
@@ -2577,16 +2736,27 @@ def make_project_tabs():
             wrap_rows.installEventFilter(column_follower)
         floors = panel_options["tabs_wrap"] and (wrap_rows.isVisible() or rows_below.isVisible())
         index = tabs.indexOf(home_page)
-        if not floors or index == -1:
+        bar = tabs.tabBar()
+        shown = bool(floors) and index != -1
+        if getattr(bar, "home_column_shown", False) != shown:
+            bar.home_column_shown = shown   # the row leaves home's foot to the column
+            bar.update()
+        if not shown:
             column.hide()
             return
-        bar = tabs.tabBar()
         rect = bar.tabRect(index)
         left = bar.mapTo(central, rect.topLeft()).x()
         row_top = bar.mapTo(central, QPoint(0, 0)).y()
         top = wrap_rows.mapTo(central, QPoint(0, 0)).y() if wrap_rows.isVisible() else row_top
         bottom = row_top + bar.height() + rows_below_height[0]
-        column.setGeometry(left, top, rect.width(), max(0, bottom - top))
+        height = max(0, bottom - top)
+        # a foot's width more than its tab, for its foot at the bottom - its
+        # own only there, so the tabs beside it still take their clicks
+        column.setGeometry(left, top, rect.width() + TAB_FOOT_RADIUS, height)
+        reach = TAB_FOOT_RADIUS + 2 * HOME_COLUMN_WALL_GAP + 1
+        column.setMask(QRegion(0, 0, rect.width(), height)
+                       .united(QRegion(rect.width() - 2 * HOME_COLUMN_WALL_GAP - 1, height - TAB_FOOT_RADIUS,
+                                       reach, TAB_FOOT_RADIUS)))
         column.show()
         column.raise_()
         column.update()
@@ -2844,7 +3014,14 @@ def make_project_tabs():
         if not panel_options["tabs_wrap"]:
             go_to_page(pages_state["page"] + step)
 
+    closing_rows = [False]
+
     def toggle_rows():
+        if closing_rows[0]:
+            return   # already on its way back to one page
+        if panel_options["tabs_wrap"] and (wrap_rows.isVisible() or rows_below.isVisible()):
+            close_rows()
+            return
         panel_options["tabs_wrap"] = not panel_options["tabs_wrap"]
         schedule_save()
         refresh_pages()
@@ -2855,6 +3032,43 @@ def make_project_tabs():
                 unroll(wrap_rows)
             if rows_below.isVisible():
                 fade_in(rows_below)
+
+    # back to one page at a time, the way the rows came: the floors over the
+    # row roll up into it and the ones under it fold away, the page easing up
+    # after them - and only then are the rows let go and the page numbers
+    # brought back in their place
+    def close_rows():
+        closing_rows[0] = True
+        waiting = [0]
+
+        def done():
+            waiting[0] -= 1
+            if waiting[0]:
+                return
+            closing_rows[0] = False
+            panel_options["tabs_wrap"] = False
+            schedule_save()
+            refresh_pages()
+            # rolled up to nothing: its height let go again for next time
+            wrap_rows.setGraphicsEffect(None)
+            wrap_rows.setMaximumHeight(QWIDGETSIZE_MAX)
+            if page_strip.isVisible():
+                fade_in(page_strip)
+
+        if wrap_rows.isVisible():
+            waiting[0] += 1
+            roll_up(wrap_rows, done)
+        if rows_below.isVisible():
+            waiting[0] += 1
+
+            def fold(height):
+                rows_below_height[0] = int(round(height))
+                if page_stack is not None:
+                    page_stack.setContentsMargins(0, rows_below_height[0], 0, 0)
+                place_page_line()
+
+            fade_out(rows_below, ROLL_MS)
+            animate_value(rows_below, rows_below_height[0], 0, fold, ROLL_MS).finished.connect(done)
 
     page_strip = PageStrip(go_to_page, turn_page)
     tabs.go_to_page = go_to_page   # a floor's empty ground clicked opens its row (see MainWindow)
@@ -2911,6 +3125,7 @@ def make_project_tabs():
                 row.show()
         wrap_rows.setVisible(bool(above))
         rows_below.setVisible(bool(after))
+        tabs.tabBar().has_rows_below = bool(after)   # the open floor the bottom one, or not (see HomeColumn)
         # with floors about, the row's own tabs are carried between them too
         tabs.tabBar().floor_drag = floor_drag if (above or after) else None
         rows_below_height[0] = len(after) * PROJECT_TABS_HEIGHT
@@ -3821,8 +4036,8 @@ class GridGraphicsView(QGraphicsView):
     def box_at(self, position):
         for item in self.items(position):
             while item is not None:
-                if isinstance(item, (NodeItem, PowerNodeItem)):
-                    return item
+                if isinstance(item, (NodeItem, PowerNodeItem, QGraphicsProxyWidget)):
+                    return item   # a box - or the info panel standing in the graph
                 item = item.parentItem()
         return None
 
@@ -4673,6 +4888,7 @@ VIEW_TOOLBAR_SPACING = 3              # on either side of the divider between tw
 VIEW_TOOLBAR_BUTTON_WIDTH = 52        # room for the widest caption, "Machine"
 VIEW_TOOLBAR_BUTTON_HEIGHT = 40       # the icon with its caption under it
 VIEW_TOOLBAR_CAPTION_SIZE = 10
+VIEW_TOOLBAR_SIDE_GAP = 8             # between the toolbar and a button standing beside it
 VIEW_TOOLBAR_DIVIDER_COLOR = "rgba(255, 255, 255, 0.14)"
 VIEW_TOOLBAR_DIVIDER_INSET = 5        # how far short of the bar's edges a divider stops
 VIEW_TOOLBAR_ACTIVE_BG = ACCENT_SHADES["blue"]["active"]              # the accent, faint: a toggle switched on
@@ -4691,6 +4907,101 @@ VIEW_TOOLBAR_ACTIVE_HOVER_BG = ACCENT_SHADES["blue"]["active_hover"]
 #   active_for  - for an on/off option, whether it is on: lit in the accent
 # Anchored like the fullscreen button - its own event filter on the view, so
 # it floats over the graph and travels with the view into full screen.
+# The project complete: a button of its own beside the toolbar's foot, out
+# with the bar folded or not. Lit once every box is ticked off as built - by
+# hand, one by one, or by clicking it, which ticks them all - and clicking it
+# lit takes every tick off again. A complete project's boxes stand in their
+# own colors rather than all green (see render_node_graph's show_done).
+COMPLETE_LABEL = "Complete"
+COMPLETE_ON_BG = "rgba(76, 175, 110, 0.55)"
+COMPLETE_ON_HOVER_BG = "rgba(76, 175, 110, 0.72)"
+
+def add_complete_button(view, toolbar):
+    holder = QWidget(view)
+    holder.setObjectName("complete_holder")
+    holder.setAttribute(Qt.WA_StyledBackground, True)
+    holder.setStyleSheet(
+        "QWidget#complete_holder {"
+        f"  background: {FULLSCREEN_BUTTON_BG};"
+        f"  border-radius: {HOVER_BORDER_RADIUS + 2}px;"
+        "}"
+    )
+    layout = QVBoxLayout(holder)
+    layout.setContentsMargins(VIEW_TOOLBAR_PADDING, VIEW_TOOLBAR_PADDING, VIEW_TOOLBAR_PADDING, VIEW_TOOLBAR_PADDING)
+    button = QToolButton(holder)
+    button.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+    button.setFixedSize(VIEW_TOOLBAR_BUTTON_WIDTH + 12, VIEW_TOOLBAR_BUTTON_HEIGHT)
+    button.setIconSize(QSize(STEP_BAR_ICON_SIZE, STEP_BAR_ICON_SIZE))
+    button.setCursor(Qt.PointingHandCursor)
+    button.setFocusPolicy(Qt.NoFocus)
+    button.setText(COMPLETE_LABEL)
+    layout.addWidget(button)
+    icons = (symbol_icon(draw_done_tick, TAB_UNSELECTED_COLOR), symbol_icon(draw_done_tick, TAB_SELECTED_COLOR))
+    hovered = [False]
+
+    def complete():
+        return bool(getattr(view, "all_done", lambda: False)())
+
+    def refresh():
+        on = complete()
+        bright = hovered[0] or on
+        button.setIcon(icons[1 if bright else 0])
+        button.setToolTip("Every box is built - click to take every tick off again" if on
+                          else "Tick every box off as built")
+        if on:   # green, the way built reads everywhere else
+            background = COMPLETE_ON_HOVER_BG if hovered[0] else COMPLETE_ON_BG
+        else:
+            background = FULLSCREEN_BUTTON_HOVER_BG if hovered[0] else "transparent"
+        button.setStyleSheet(
+            "QToolButton {"
+            "  border: none;"
+            "  padding: 3px 0 2px 0;"
+            f"  border-radius: {HOVER_BORDER_RADIUS}px;"
+            f"  background: {background};"
+            f"  color: {TAB_SELECTED_COLOR if bright else TAB_UNSELECTED_COLOR};"
+            f"  font-size: {VIEW_TOOLBAR_CAPTION_SIZE}px;"
+            "}"
+            "QToolButton:pressed {"
+            f"  background: {TAB_SYMBOL_PRESS_BG};"
+            "}"
+        )
+
+    # beside the toolbar, level with its foot - wherever its folding puts it
+    def place():
+        holder.adjustSize()
+        holder.move(toolbar.x() - VIEW_TOOLBAR_SIDE_GAP - holder.width(),
+                    toolbar.y() + toolbar.height() - holder.height())
+        holder.raise_()
+
+    class Follow(QObject):
+        def eventFilter(self, watched, event):
+            kind = event.type()
+            if kind in (QEvent.Move, QEvent.Resize, QEvent.Show):
+                place()
+            elif watched is button and kind in (QEvent.Enter, QEvent.Leave):
+                hovered[0] = kind == QEvent.Enter
+                refresh()
+            return False
+
+    holder.follow = Follow(holder)   # kept alive by it
+    toolbar.installEventFilter(holder.follow)
+    view.installEventFilter(holder.follow)
+    button.installEventFilter(holder.follow)
+
+    def clicked():
+        setter = getattr(view, "set_all_done", None)
+        if setter is not None:
+            setter(not complete())
+        refresh()
+        pulse(button)
+
+    button.clicked.connect(clicked)
+    view.on_done_changed = refresh   # a box ticked off by hand may finish it, or undo it
+    holder.refresh = refresh
+    refresh()
+    place()
+    return holder
+
 def add_view_toolbar(view):
     bar = QWidget(view)
     bar.setObjectName("view_toolbar")
@@ -5254,7 +5565,7 @@ NODE_BG = QColor(GRID_BG).lighter(140)
 # a box the user has ticked off as built: its ground goes green, so what is
 # standing in the world and what is still to put up read apart at a glance
 # across the whole map, at any zoom, without reading a word of it
-NODE_DONE_BG = QColor("#1f3b2a")
+NODE_DONE_BG = QColor("#33503f")   # a soft, muted green: built, without shouting it
 NODE_BORDER_COLOR = TAB_INDICATOR_COLOR
 NODE_OUTPUT_BORDER_COLOR = "#3ddc84"   # the final products themselves
 NODE_INPUT_BORDER_COLOR = "#f39c12"    # recipes fed straight from a raw resource, nothing crafted below them
@@ -5629,15 +5940,22 @@ def border_arrow_tuck(x, border_y, upward):
 # block clear of the topmost box, the node itself centered over the whole graph
 # above that. None when there is nothing to power.
 def power_layout(nodes):
-    boxes = [node.coordinate for node in nodes if not is_power_node(node)]
+    # the tree's own boxes: a source node, off to the side of what it feeds,
+    # moves nothing of the power's
+    boxes = [node.coordinate for node in nodes
+             if not is_power_node(node) and not isinstance(node, search.Source_Node)]
     if not boxes:
         return None
     top = min(y for _, y in boxes)
     left = min(x for x, _ in boxes)
     right = max(x for x, _ in boxes) + node_width()
     rail_y = top - POWER_RAIL_GAP
+    # room over the rail for the lanes (see power_lanes): one a column, about
+    # half the columns coming in from either side
+    columns = len({round(x) for x, _ in boxes})
+    lanes = min(math.ceil(columns / 2) * POWER_LANE_STEP, POWER_LANES_MAX)
     return rail_y, QPointF((left + right - POWER_NODE_WIDTH) / 2,
-                           rail_y - POWER_NODE_GAP - POWER_NODE_HEIGHT)
+                           rail_y - POWER_NODE_GAP - lanes - POWER_NODE_HEIGHT)
 
 # the box at the top of the map: what every machine under it draws, added up.
 # Clicking it brings its lines up out of the background (on_click), and it is
@@ -5830,6 +6148,40 @@ class PowerEdge(QGraphicsPathItem):
         color.setAlpha(alpha)
         return color
 
+    # Up out of its box to a lane of its own, across along it to under the
+    # power node, and up into it - a rounded corner at each turn. Lanes are
+    # handed out so that no two lines run together (see power_lanes): each
+    # reads as its own until the last climb, where they all join.
+    #
+    # Both its ends stop where the arrow on that border meets the line: the
+    # tip of one standing out over the border (a generator's, pointing up off
+    # its box; the power node's, pointing down off it) or the border itself
+    # where the arrow stands inside it. A line run on into the arrow showed
+    # through it, and past it onto the box, once it was lit and drawn over
+    # the boxes. A pump's line (`tuck`) has no arrow at its pump, and runs on
+    # under it instead.
+    def set_lane(self, box_top, lane_y, power_point, tuck=None):
+        reach = border_arrow_reach()
+        if self.feeding:
+            box_top = QPointF(box_top.x(), box_top.y() - reach)
+        else:
+            power_point = QPointF(power_point.x(), power_point.y() + reach)
+        start_y = box_top.y() + tuck if tuck is not None else box_top.y()
+        self.top, self.end = box_top, power_point
+        self.rail_y = lane_y = min(lane_y, box_top.y())
+        across = power_point.x() - box_top.x()
+        way = 1 if across >= 0 else -1
+        # as round as the room allows: never past the turn's own legs
+        turn = min(GRID_SQUARE / 2, abs(across) / 2, abs(box_top.y() - lane_y) / 2,
+                   abs(lane_y - power_point.y()) / 2)
+        path = QPainterPath(QPointF(box_top.x(), start_y))
+        path.lineTo(box_top.x(), lane_y + turn)
+        path.quadTo(box_top.x(), lane_y, box_top.x() + way * turn, lane_y)
+        path.lineTo(power_point.x() - way * turn, lane_y)
+        path.quadTo(power_point.x(), lane_y, power_point.x(), lane_y - turn)
+        path.lineTo(power_point)
+        self.setPath(path)
+
     # laid again from scratch: its machine was dragged, or the graph grew and
     # took the power node with it
     # `tuck` is how far the line runs on into what it leaves from (see below):
@@ -5896,6 +6248,8 @@ def node_label(node):
         return node.item.display_name
     if isinstance(node, Recipe_Node):
         return node.recipe_name
+    if isinstance(node, search.Source_Node):
+        return f"{resource_name(node.item)} source"
     return f"Node {node.id}"
 
 # a Recipe_Node carries both pictures - the building it runs in and the item it
@@ -6110,6 +6464,8 @@ def node_power(node, values):
         return node.building.power * values["machine_nb"]
     if not isinstance(node, Recipe_Node):
         return None
+    if getattr(node, "on_sites", False):
+        return node.needed_power   # one extractor a node, each at its own clock
     return power_for(node, values["machine_nb"])
 
 # the two ends of that draw, for a recipe that swings over a range while it
@@ -6269,8 +6625,23 @@ def ignore_closed_wheel(combo):
     combo.installEventFilter(combo.wheel_guard)
     return combo
 
-def picture_label(path, size):
-    picture = QLabel()
+# A picture drawn in its own colors even on a widget greyed out: a card held by
+# the lock still shows what it makes, only its fields and buttons greyed.
+class SteadyPicture(QLabel):
+    def paintEvent(self, event):
+        pixmap = self.pixmap()
+        if self.isEnabled() or pixmap is None or pixmap.isNull():
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        size = pixmap.deviceIndependentSize()
+        painter.drawPixmap(QPointF((self.width() - size.width()) / 2,
+                                   (self.height() - size.height()) / 2), pixmap)
+        painter.end()
+
+# `steady`: kept in its colors when greyed out (see SteadyPicture)
+def picture_label(path, size, steady=False):
+    picture = SteadyPicture() if steady else QLabel()
     picture.setFixedSize(size, size)
     picture.setStyleSheet("background: transparent;")
     # nothing to load: the power node gets the same drawn bolt as the toolbar
@@ -6612,21 +6983,61 @@ def make_node_info_panel(parent):
     # Only its top takes it - the strip it is dragged by and the heading
     # under it - whether a press at `point` (on the screen) is there. The
     # rest is what it says, its buttons and its text to select.
+    # `point` in the panel's own terms: it stands in the graph (see
+    # render_node_graph), where the screen's say nothing about where it is
     def in_grab_area(point):
-        if grip.geometry().contains(panel.mapFromGlobal(point)):
+        if grip.geometry().contains(point):
             return True
         box = heading[0]
         try:
-            return box is not None and box.isVisible() and box.rect().contains(box.mapFromGlobal(point))
+            return box is not None and box.isVisible() and box.rect().contains(box.mapFrom(panel, point))
         except RuntimeError:
             return False   # the last node's, gone
 
     panel.in_grab_area = in_grab_area
 
+    # a source box's heading: its node's picture, "Coal source", its tag in
+    # the resource's color
+    def source_header(marker):
+        box = QWidget()
+        row = QHBoxLayout(box)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(10)
+        row.addWidget(picture_label(source_picture(marker.item), NODE_INFO_PICTURE_SIZE), 0, Qt.AlignTop)
+        column = QVBoxLayout()
+        column.setSpacing(4)
+        column.addWidget(info_label(f"{resource_name(marker.item)} source", DIALOG_TEXT_COLOR,
+                                    NODE_INFO_TITLE_FONT_SIZE, bold=True, wrap=True))
+        color = QColor(resource_color(marker.item))
+        if color.lightness() < 60:
+            color = QColor(TEXT_MUTED)   # a black resource's tag still read on the panel
+        tag = info_label("Resource node", color.name(), NODE_INFO_SMALL_FONT_SIZE, bold=True)
+        tag.setStyleSheet(tag.styleSheet() +
+                          f" background: rgba({color.red()}, {color.green()}, {color.blue()}, {NODE_INFO_TAG_ALPHA});"
+                          f" border-radius: {HOVER_BORDER_RADIUS}px; padding: 1px 6px;")
+        tag.setProperty("fixed_accent", True)
+        column.addWidget(tag, 0, Qt.AlignLeft)
+        row.addLayout(column, 1)
+        for label in box.findChildren(QLabel):
+            label.setTextInteractionFlags(Qt.NoTextInteraction)
+            label.unsetCursor()
+        box.setCursor(Qt.OpenHandCursor)
+        return box
+
     def set_node(node, values):
         showing[:] = [node, values]
         clear()
         panel.show_manager_open = lambda on: None   # the last node's button goes with it
+        if isinstance(node, search.Source_Node):
+            heading[0] = source_header(node)
+            body_layout.addWidget(heading[0])
+            body_layout.addWidget(make_panel_divider())
+            builder = getattr(panel, "source_body", None)
+            if builder is not None:
+                body_layout.addWidget(builder(node))
+            for index in range(body_layout.count()):
+                body_layout.itemAt(index).widget().show()
+            return
         heading[0] = header(node)
         body_layout.addWidget(heading[0])
         body_layout.addWidget(make_panel_divider())
@@ -6771,9 +7182,9 @@ def make_node_info_panel(parent):
             body_layout.addWidget(stats([("Rate", f"{rate_number(values['rate'])} {rate_unit(node.item)}")]))
 
         body_layout.addWidget(make_panel_divider())
-        # the power node is the whole factory's tally rather than anything to
-        # put up, so it is the one box with nothing to tick off
-        if not is_power_node(node) and panel.on_complete is not None:
+        # the power node, an output and a hand source are nothing to put up,
+        # so there is nothing to tick off on them (see can_be_built)
+        if can_be_built(node) and panel.on_complete is not None:
             body_layout.addWidget(done_button(node))
         body_layout.addWidget(more_block(node))
 
@@ -6837,11 +7248,15 @@ def make_node_info_panel(parent):
 
     layout.addWidget(scroll, 1)
 
-    # taken off its node, it can be shut from itself - the box's caret is no
-    # longer next to it - or snapped back onto it
+    # it can be shut from itself - taken off its node, the box's caret is no
+    # longer next to it - or snapped back onto its node. Both buttons stand
+    # there either way: the cross shuts it, and the
+    # snap-back is greyed out while there is nothing to snap back to
     def set_detached(on):
-        grip.close_button.setVisible(on)
-        grip.home_button.setVisible(on)
+        grip.close_button.setVisible(True)
+        grip.home_button.setVisible(True)
+        grip.home_button.setEnabled(on)
+        grip.home_button.setToolTip("Snap back to its box" if on else "On its box already")
 
     grip.close_button.clicked.connect(lambda: panel.on_close() if panel.on_close is not None else None)
     grip.home_button.clicked.connect(lambda: panel.on_snap_back() if panel.on_snap_back is not None else None)
@@ -6865,9 +7280,11 @@ def draw_snap_back(p, c):
 
 # The strip along the top of a floating panel it is taken hold of by, the
 # whole width of it: a few dots in its middle to say so, and at its right a
-# cross - hidden until the panel is shut from there (see set_detached). It
+# snap-back and a cross (see set_detached). It
 # lets presses through to the panel, which does the dragging.
 NODE_INFO_GRIP_HEIGHT = 20
+INFO_PANEL_Z = 1000         # the info panel, standing in the graph: over everything in it
+INFO_PULSE_LOW = 0.45       # moved over to another box: it dips to this and comes back up
 NODE_INFO_GRIP_DOT = 2.2       # each dot's width
 NODE_INFO_GRIP_GAP = 4         # dot to dot
 NODE_INFO_GRIP_COLOR = TEXT_FAINT
@@ -7503,7 +7920,37 @@ POWER_LINE_ALPHA = 55              # at rest the line keeps out of the way...
 POWER_LINE_LIVE_ALPHA = 225        # ...and comes up when the power node is picked out
 POWER_LIVE_WIDEN = 1.6             # thickening with it
 POWER_RAIL_GAP = GRID_SQUARE       # the block of clear air above the topmost node
-POWER_NODE_GAP = GRID_SQUARE * 2   # from the rail up to the power node's box
+POWER_NODE_GAP = GRID_SQUARE * 2   # from the rail up to the power node's box, with no lanes over it
+POWER_LANE_STEP = GRID_STEP * 1.5  # between two power lines' lanes, on one side of the power node
+POWER_LANE_ROOM = GRID_SQUARE      # kept clear under the power node, for the lines to turn up into it
+POWER_LANES_MAX = GRID_SQUARE * 6  # the most the lanes ever lift the power node by
+
+# The lanes power lines run along to the power node, so that no two run
+# together: `ends` is {key: (where it leaves its box, where it lands)}. On
+# each side of the power node the line from nearest it takes the lowest lane,
+# `rail`, and each one further out the lane over that - so they nest, the
+# outer ones running over the inner ones without crossing. Boxes standing in
+# one column climb the same way already, one line over the other: they share
+# a lane, their lines lying along each other all the way to the power node
+# rather than branching apart at the top. The lanes close up when there are
+# more of them than fit under `ceiling`, the power node's bottom. Returns
+# {key: lane height}.
+def power_lanes(ends, rail, ceiling):
+    lanes = {}
+    room = rail - (ceiling + POWER_LANE_ROOM)
+    columns = {}
+    for key, (start, end) in ends.items():
+        columns.setdefault((round(start.x()), round(end.x())), []).append(key)
+    for left in (True, False):
+        group = sorted((column for column in columns if (column[0] < column[1]) == left),
+                       key=lambda column: abs(column[0] - column[1]))
+        step = POWER_LANE_STEP
+        if len(group) > 1:
+            step = max(0.0, min(step, room / (len(group) - 1)))
+        for index, column in enumerate(group):
+            for key in columns[column]:
+                lanes[key] = rail - index * step
+    return lanes
 POWER_NODE_WIDTH = NODE_WIDTH * 1.4   # wider than a node: it carries a column of its own
 POWER_NODE_HEIGHT = NODE_HEIGHT * 0.95   # its name, what is made, and what is drawn
 POWER_NODE_FONT_SIZE = 40          # about the node names' own size
@@ -7613,6 +8060,7 @@ class ConveyorEdge(QGraphicsPathItem):
         self.highlight = None
         self.glow = 0.0
         self.glow_animation = None
+        self.base_color = NODE_LINE_COLOR   # its color at rest - a source's line wears its resource's
         self.last_highlight = (NODE_LINE_COLOR, NODE_LINE_COLOR)   # what it is fading back from
         # how far its label has faded back while another node's lines are
         # picked out: 0 not at all, 1 down to CONVEYOR_LABEL_DIM_OPACITY
@@ -7865,18 +8313,25 @@ class ConveyorEdge(QGraphicsPathItem):
                 pass   # a scene gone while the app closes
         return super().itemChange(change, value)
 
+    # A source node's line into its extraction: in its resource's color, and
+    # saying nothing - what it carries is what the box it feeds says
+    def set_source_look(self, color):
+        self.base_color = QColor(color).name()
+        self.label.setPlainText("")
+        self.apply_highlight()
+
     def apply_highlight(self):
         # up over the other lines while it is picked out, back down after -
         # raised as soon as the light starts coming up, lowered once it is gone
         self.setZValue(CONVEYOR_Z if self.glow <= 0 else CONVEYOR_LIVE_Z)
         pen = self.pen()
         if self.highlight is None and self.glow <= 0:
-            pen.setBrush(QBrush(QColor(NODE_LINE_COLOR)))
+            pen.setBrush(QBrush(QColor(self.base_color)))
             self.label.setDefaultTextColor(QColor(CONVEYOR_LABEL_COLOR))
-            tip = QColor(NODE_LINE_COLOR)
+            tip = QColor(self.base_color)
         else:
             lit = self.highlight if self.highlight is not None else self.last_highlight
-            maker, taker = (blend_color(NODE_LINE_COLOR, color, self.glow) for color in lit)
+            maker, taker = (blend_color(self.base_color, color, self.glow) for color in lit)
             self.last_highlight = lit
             if maker == taker:
                 pen.setBrush(QBrush(QColor(maker)))
@@ -8551,11 +9006,24 @@ class NodeItem(QGraphicsRectItem):
         self.hover_animation = animate_value(owner, self.hover_level, to, step, NODE_HOVER_MS)
         self.hover_animation.finished.connect(lambda: setattr(self, "hover_animation", None))
 
+    # Lit while the mouse is over the box itself - not over a source box
+    # hanging off it as its child, whose hover Qt hands its parent too
+    def hover_to(self, event):
+        to = 1.0 if self.rect().contains(event.pos()) else 0.0
+        if getattr(self, "hover_target", None) != to:
+            self.hover_target = to
+            self.ease_hover(to)
+
     def hoverEnterEvent(self, event):
-        self.ease_hover(1.0)
+        self.hover_to(event)
         super().hoverEnterEvent(event)
 
+    def hoverMoveEvent(self, event):
+        self.hover_to(event)
+        super().hoverMoveEvent(event)
+
     def hoverLeaveEvent(self, event):
+        self.hover_target = 0.0
         self.ease_hover(0.0)
         super().hoverLeaveEvent(event)
 
@@ -8592,7 +9060,10 @@ class NodeItem(QGraphicsRectItem):
         # them on purpose off the grid (a duplicate half a square under its
         # merger), and those must land exactly where they were put
         # (read with getattr: Qt already calls this while __init__ sets the flags)
-        dragging = getattr(self, "press_pos", None) is not None
+        # Held is what counts, not press_pos: the second press of a double
+        # click comes as a double click, which leaves press_pos clear, and a
+        # box dragged on from there went where the mouse put it, off the grid
+        dragging = getattr(self, "held", False) or getattr(self, "press_pos", None) is not None
         if change == QGraphicsItem.ItemPositionChange and panel_options["snap"] and dragging and not animating:
             return QPointF(snap_to_grid(value.x()), snap_to_grid(value.y()))
         if change == QGraphicsItem.ItemPositionHasChanged:
@@ -8732,6 +9203,7 @@ class NodeItem(QGraphicsRectItem):
 
     def mousePressEvent(self, event):
         self.press_pos = event.scenePos()
+        self.held = True
         if not panel_options["locked"]:
             self.setCursor(Qt.ClosedHandCursor)
         self.update()
@@ -8739,6 +9211,7 @@ class NodeItem(QGraphicsRectItem):
 
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
+        self.held = False
         if self.press_pos is not None:
             moved = (event.scenePos() - self.press_pos).manhattanLength()
             if moved < NODE_CLICK_DRAG_THRESHOLD:
@@ -8761,6 +9234,7 @@ class NodeItem(QGraphicsRectItem):
     # press_pos and all, rather than being taken for a double one.
     def mouseDoubleClickEvent(self, event):
         event.accept()
+        self.held = True   # still a press: a drag from here snaps like any other
         if panel_options["quick_done"]:
             return   # the first click ticked it off and the second put it back
         if (time.monotonic() - self.last_click) * 1000 > NODE_DOUBLE_CLICK_MS:
@@ -8877,6 +9351,8 @@ def is_generator(node):
     return isinstance(node, Recipe_Node) and any(entry["item"] is POWER_ITEM for entry in node.recipe.products)
 
 def node_border_color(node):
+    if isinstance(node, search.Source_Node):
+        return resource_color(node.item)
     if is_power_node(node) or is_generator(node):
         return POWER_COLOR
     if isinstance(node, search.Consumer_Node):
@@ -8898,8 +9374,9 @@ def node_border_color(node):
 # `extra`, when given, hands over what draws power from outside the tree for
 # the steps just built (see extra_draw), put on them before they are laid out
 def generate_node_graph(view, output, step=0, extra=None, consumers=None):
-    # an ore's extraction runs in the miner the options pick
-    set_miner_mark(panel_options["miners_mark"])
+    # an ore's extraction runs in the miner the options pick - or on the
+    # resource nodes the project has
+    prepare_build(getattr(view, "project_page", None))
     steps = Node.get_nodes_from_outputs(output, panel_options["recipe_choices"],
                                         panel_options["node_recipe_choices"], consumers=consumers)
     if extra is not None:
@@ -8925,6 +9402,11 @@ def build_steps_bounds(steps):
                 continue   # nor an output shown as an outline instead
             x, y = node.coordinate
             bounds = bounds.united(QRectF(x, y, node_width(), NODE_HEIGHT))
+            # its source node, where the map has one standing for it
+            source = getattr(node, "source_node", None)
+            if source is not None and wants_source(node):
+                x, y = source.coordinate
+                bounds = bounds.united(QRectF(x, y, source_width(), NODE_HEIGHT))
     return bounds
 
 # renders whichever step the view is parked on. An empty build still gets a
@@ -9030,6 +9512,7 @@ def drawing_options():
             panel_options["hide_outputs"])
 
 def render_node_graph(view, frame):
+    frame = with_sources(frame, view)   # every extraction box with its source node
     # where each box's products go, as its info panel lists them: read
     # before any output is taken out of the step
     item_flows = product_flows(frame)
@@ -9071,8 +9554,12 @@ def render_node_graph(view, frame):
     # the items a node keeps a border port for: all of them, less the ones
     # every line of which comes down the column. An ingredient nothing supplies
     # is in no link at all, so it keeps its port, as it always did.
+    sourced = {mother for mother, daughter, _, _ in frame["links"] if isinstance(daughter, search.Source_Node)}
+
     def port_items(node, side):
         items = input_items(node) if side == "in" else output_items(node)
+        if side == "in" and node in sourced:
+            items = items + [node.needed_item]   # where its source's line comes in
         return [item for item in items
                 if ((node, side, item) not in down_column or (node, side, item) in on_the_side)
                 and (node, side, item) not in only_hidden]
@@ -9088,9 +9575,22 @@ def render_node_graph(view, frame):
     scene = QGraphicsScene()
     scene.setSceneRect(-SCENE_EXTENT, -SCENE_EXTENT, SCENE_EXTENT * 2, SCENE_EXTENT * 2)
 
-    info_panel = make_node_info_panel(view)
+    # The panel stands in the graph itself, at a point of it, and is drawn
+    # with it: panned or zoomed, it keeps its place and its size against its
+    # box, hung off the box's corner - or, dragged away, off the spot of the
+    # map it was put down on. Every place it is put is a point of the scene
+    # and a step off it in the panel's own pixels (see set_anchor).
+    info_panel = make_node_info_panel(None)
     view.info_panel = info_panel
+    info_proxy = scene.addWidget(info_panel)
+    info_proxy.setZValue(INFO_PANEL_Z)
+    # scene units to one of its pixels: set as it opens, so it is its own size
+    # on screen at the zoom it is opened at - and from then on it is drawn
+    # with the map, growing and shrinking with its box as the map is zoomed
+    info_scale = [1.0]
+    info_panel.hide()
     info_panel.product_flows = item_flows
+    info_panel.source_body = lambda marker: make_source_manager(view, marker)   # a source's node manager
     info_panel.is_done = lambda node: node_key(node) in view.completed
     info_panel.on_complete = lambda node: toggle_done(node)
     open_node = [None]     # the node picked out: its border and its lines lit
@@ -9101,21 +9601,49 @@ def render_node_graph(view, frame):
         info_panel.on_recipe_manage = view.on_node_recipe_manage
         info_panel.manager_open_for = view.manager_open_for
 
-    # where the panel hangs off `item`, at the height it has now
-    def spot_by(item):
-        viewport = view.viewport()
-        # anchored to the node's own top right corner, not a fixed view corner
-        top_right = view.mapFromScene(item.mapToScene(item.rect().topRight()))
-        x = top_right.x() + NODE_INFO_GAP
-        if x + info_panel.width() > viewport.width():
-            top_left = view.mapFromScene(item.mapToScene(item.rect().topLeft()))
-            x = top_left.x() - info_panel.width() - NODE_INFO_GAP   # no room right, hang left instead
-        # ...and then pulled back inside the view, so a node near an edge does
-        # not push its panel half out of sight
-        x = max(NODE_INFO_MARGIN, min(x, viewport.width() - info_panel.width() - NODE_INFO_MARGIN))
-        y = max(NODE_INFO_MARGIN, min(top_right.y(),
-                                      viewport.height() - info_panel.height() - NODE_INFO_MARGIN))
-        return QPoint(round(x), round(y))
+    # Which side of its box the panel hangs on: None lets it pick - its right,
+    # or its left with no room there - "left" or "right" when it was put
+    # back onto that side by hand (see snap_info_back)
+    info_side = [None]
+
+    # the panel put at scene point `point`, `offset` of its own pixels off it
+    def set_anchor(point, offset=QPointF()):
+        info_proxy.setPos(point + offset * info_scale[0])
+
+    # sized for the zoom the map stands at now: its own size on screen
+    def measure_info():
+        zoom = view.transform().m11() or 1.0
+        info_scale[0] = 1.0 / zoom
+        info_proxy.setScale(info_scale[0])
+        loose_size[0] = 1.0   # its own size on screen, should it be put down somewhere
+
+    # where the panel stands on screen, as a rect of the view's
+    def panel_rect():
+        return view.mapFromScene(info_proxy.mapRectToScene(info_proxy.boundingRect())).boundingRect()
+
+    def panel_pos():
+        return panel_rect().topLeft()
+
+    # the side of `item` the panel hangs on when it is left to pick: its
+    # right, or its left with no room on screen there
+    def picked_side(item, side=None):
+        side = side or info_side[0]
+        if side in ("left", "right"):
+            return side
+        right = view.mapFromScene(item.mapToScene(item.rect().topRight())).x() + NODE_INFO_GAP
+        return "right" if right + info_panel.width() <= view.viewport().width() else "left"
+
+    # where the panel hangs off `item` on `side`: a corner of the box, and the
+    # step off it on screen
+    def hang_point(item, side):
+        if side == "left":
+            return item.mapToScene(item.rect().topLeft()), QPointF(-info_panel.width() - NODE_INFO_GAP, 0)
+        return item.mapToScene(item.rect().topRight()), QPointF(NODE_INFO_GAP, 0)
+
+    # ...and where that is on screen, for the panel's top left corner
+    def spot_by(item, side=None):
+        point, offset = hang_point(item, picked_side(item, side))
+        return view.mapFromScene(point + offset * info_scale[0])
 
     # It grows with its content but never past the view it floats over -
     # what does not fit scrolls inside the panel instead of off screen.
@@ -9128,21 +9656,31 @@ def render_node_graph(view, frame):
         room = max(NODE_INFO_MIN_HEIGHT, viewport.height() - 2 * NODE_INFO_MARGIN)
         info_panel.setFixedHeight(min(wanted, room))
 
+    # the side it hangs on, once it has picked
+    hang_side = ["right"]
+
     def position_info_panel(item):
         fit_info_height()
-        info_panel.move(spot_by(item))
-        info_panel.raise_()
+        measure_info()
+        hang_side[0] = picked_side(item)
+        set_anchor(*hang_point(item, hang_side[0]))
         # the recipe manager opened from it stands beside it
         follower = getattr(view, "on_info_panel_moved", None)
         if follower is not None:
             follower()
 
-    # re-anchors the open node's panel whenever the view itself moves, so it
-    # stays glued to its node instead of drifting off as you pan/zoom
-    # - unless it was dragged off its node: it then stays where it was put
+    # Panned or zoomed: hung off its box, it keeps its own size on screen
+    # whatever the zoom, and to the box's side; put down off its box, it is
+    # part of the map - on the spot of it it was put on, growing and
+    # shrinking with it as it is zoomed. Whatever stands by it on screen -
+    # the recipe manager - is laid out against it again.
     def reposition_info():
-        if info_open[0] and open_node[0] is not None and not info_dragged[0]:
-            position_info_panel(items_by_node[open_node[0]])
+        if info_open[0] and open_node[0] in items_by_node and not info_dragged[0]:
+            measure_info()
+            set_anchor(*hang_point(items_by_node[open_node[0]], hang_side[0]))
+        elif info_dragged[0] and loose_scene[0] is not None:
+            set_anchor(loose_scene[0])
+        follow_info()
 
     # The panel can be taken hold of anywhere nothing else takes the press -
     # its ground, its words - and put down anywhere over the map. It stays
@@ -9150,11 +9688,17 @@ def render_node_graph(view, frame):
     # it is opened on another node. The recipe manager bolted to it goes too.
     info_dragged = [False]
 
+    # put down at `spot`, a point on screen: from there on it stands on the
+    # spot of the map under it (loose_scene), at the size it came off at,
+    # going with the map from then on - see reposition_info
+    loose_spot = [None]
+    loose_scene = [None]
+    loose_size = [1.0]
+
     def move_info(spot):
-        viewport = view.viewport()
-        x = max(NODE_INFO_MARGIN, min(spot.x(), viewport.width() - info_panel.width() - NODE_INFO_MARGIN))
-        y = max(NODE_INFO_MARGIN, min(spot.y(), viewport.height() - info_panel.height() - NODE_INFO_MARGIN))
-        info_panel.move(x, y)
+        loose_spot[0] = QPoint(round(spot.x()), round(spot.y()))
+        loose_scene[0] = view.mapToScene(loose_spot[0])
+        set_anchor(loose_scene[0])
         follower = getattr(view, "on_info_panel_moved", None)
         if follower is not None:
             follower()
@@ -9163,9 +9707,12 @@ def render_node_graph(view, frame):
     def drag_info_by(delta):
         if not info_open[0] or info_panel.isHidden():
             return False
+        if not info_dragged[0]:
+            # coming off its box: as big on screen as it stands now, from here on
+            loose_size[0] = info_scale[0] * (view.transform().m11() or 1.0)
         info_dragged[0] = True
         info_panel.set_detached(True)   # off its node: its own cross shuts it
-        move_info(info_panel.pos() + delta)
+        move_info(panel_pos() + delta)
         return True
 
     class InfoDrag(QObject):
@@ -9176,7 +9723,7 @@ def render_node_graph(view, frame):
         def eventFilter(self, watched, event):
             kind = event.type()
             if (kind == QEvent.MouseButtonPress and event.button() == Qt.LeftButton
-                    and info_panel.in_grab_area(event.globalPosition().toPoint())):
+                    and info_panel.in_grab_area(event.position().toPoint())):
                 self.press = event.globalPosition().toPoint()
                 QApplication.setOverrideCursor(Qt.ClosedHandCursor)
                 return True
@@ -9192,33 +9739,44 @@ def render_node_graph(view, frame):
                 return True
             return False
 
+    # the side of `item` the panel stands nearer to, where it is now
+    def nearer_side(item):
+        here = panel_pos()
+        return min(("right", "left"), key=lambda side: (spot_by(item, side) - here).manhattanLength())
+
     # Back onto its box: it glides from where it was put to where it hangs
-    # off the box, the recipe manager along with it, and follows the box
-    # again from then on - from its button, or let go close to that spot.
+    # off the box - on whichever side of it it was nearer to - the recipe
+    # manager along with it, and follows the box again from then on: from
+    # its button, or let go close to either of its spots.
     def snap_info_back():
         node = open_node[0]
         if not info_open[0] or node not in items_by_node:
             return
-        info_dragged[0] = False
+        item = items_by_node[node]
+        info_side[0] = nearer_side(item)
         info_panel.set_detached(False)
-        follower = getattr(view, "on_info_panel_moved", None)
-        glide = QPropertyAnimation(info_panel, b"pos", info_panel)
-        glide.setDuration(INFO_SNAP_MS)
-        glide.setEasingCurve(QEasingCurve.OutCubic)
-        glide.setStartValue(info_panel.pos())
-        glide.setEndValue(spot_by(items_by_node[node]))
-        if follower is not None:
-            glide.valueChanged.connect(lambda _: follower())
-        # the box may have moved under it on the way: it lands where it hangs now
-        glide.finished.connect(reposition_info)
-        run(glide)
+        start = QPointF(panel_pos())
+
+        # on screen from where it was put to where it hangs - read again each
+        # step, the map may move under it on the way - then hung off the box
+        def step(t):
+            end = QPointF(spot_by(item))
+            move_info(start + (end - start) * float(t))
+
+        def land():
+            info_dragged[0] = False
+            position_info_panel(item)
+
+        glide = animate_value(info_panel, 0.0, 1.0, step, INFO_SNAP_MS, QEasingCurve.OutCubic)
+        glide.finished.connect(land)
 
     def drop_info():
         node = open_node[0]
         if not info_dragged[0] or not info_open[0] or node not in items_by_node:
             return
-        home = spot_by(items_by_node[node])
-        if (info_panel.pos() - home).manhattanLength() <= INFO_SNAP_DISTANCE:
+        item = items_by_node[node]
+        if any((panel_pos() - spot_by(item, side)).manhattanLength() <= INFO_SNAP_DISTANCE
+               for side in ("right", "left")):
             snap_info_back()
 
     info_panel.drag = InfoDrag(info_panel)
@@ -9228,8 +9786,25 @@ def render_node_graph(view, frame):
     view.drop_info = drop_info
     view.drag_info_by = drag_info_by
 
+    # The lines a picked node lights: those into and out of it - or, for an
+    # output, every line of the tree under it, all it took to make it. An
+    # output is fed by its daughters, they by theirs, and so on down: every
+    # line taken from a box in that tree is one it needed (a loop is walked
+    # round the once). As keys of edge_items.
+    def lit_lines(node):
+        if not isinstance(node, Output_Node):
+            return {key for key in edge_items if node is key[0] or node is key[1]}
+        chain, stack = set(), [node]
+        while stack:
+            here = stack.pop()
+            if id(here) in chain:
+                continue
+            chain.add(id(here))
+            stack.extend(here.daughter_nodes)
+        return {key for key in edge_items if id(key[0]) in chain}
+
     # the lines into and out of one node, for picking its own supply out of
-    # the rest of the map while its panel is open
+    # the rest of the map while its panel is open - all its tree's, for an output
     def highlight_supply(node, on):
         item = items_by_node.get(node)
         # the power node's own supply is every line running up to it
@@ -9239,9 +9814,8 @@ def render_node_graph(view, frame):
             for line in power_lines:
                 line.set_live(on)
             return
-        for (mother, daughter), edge in edge_items.items():
-            if mother is node or daughter is node:
-                edge.set_highlight(on, node_border_color(daughter), node_border_color(mother))
+        for mother, daughter in lit_lines(node):
+            edge_items[mother, daughter].set_highlight(on, node_border_color(daughter), node_border_color(mother))
         if isinstance(item, NodeItem):
             item.set_selected(on)
             if getattr(item, "power_line", None) is not None:
@@ -9259,8 +9833,9 @@ def render_node_graph(view, frame):
         open_node[0] = node
         if node is not None:
             highlight_supply(node, True)
-        for (mother, daughter), edge in edge_items.items():
-            edge.set_label_dimmed(node is not None and node is not mother and node is not daughter)
+        lit = lit_lines(node) if node is not None else set()
+        for key, edge in edge_items.items():
+            edge.set_label_dimmed(node is not None and key not in lit)
 
     # each node's caret shows whether the panel standing open is its own
     def refresh_info_buttons():
@@ -9275,38 +9850,57 @@ def render_node_graph(view, frame):
         info_open[0] = False
         # with the recipe manager out, the two go together: slid back toward
         # the box as they fade, the manager bolted on all the way - rather
-        # than the manager left folding up on its own where the panel was
-        if getattr(view, "manager_is_out", lambda: False)() and open_node[0] in items_by_node:
-            retract_info()
-        else:
-            fade_out(info_panel)
+        # than the manager left folding up on its own where the panel was.
+        # Dragged off its box, it is no longer by it to slide back to: it
+        # fades where it stands, the manager fading with it.
+        attached = not info_dragged[0] and open_node[0] in items_by_node
+        retract_info(slide=attached and getattr(view, "manager_is_out", lambda: False)())
         refresh_info_buttons()
         closed = getattr(view, "on_info_closed", None)   # the manager bolted to it shuts with it
         if closed is not None:
             closed()
 
-    # The panel drawn back toward its box: a short slide that way - left, for
-    # a panel standing on the box's right - fading out as it goes. Meanwhile
-    # it stays what the manager is bolted to (view.info_closing), shut or not.
+    # The panel shut: a short slide back toward its box - left, for a panel
+    # standing on the box's right - fading out as it goes, or with `slide`
+    # off only the fade, where it stands. A picture of it does the going:
+    # the panel itself is a whole tree of widgets, and faded through an
+    # effect it was drawn again on every frame, its rows and its scroll bar
+    # catching up a frame behind - the panel shook as it went. The picture
+    # stays what the manager is bolted to (view.info_closing) until it is gone.
     retracting = [None]
 
-    def retract_info():
-        box = items_by_node[open_node[0]]
-        middle = view.mapFromScene(box.mapToScene(box.rect().center())).x()
-        toward = -1 if middle < info_panel.x() + info_panel.width() / 2 else 1
-        start = info_panel.pos()
+    def retract_info(slide=True):
+        toward = 0
+        if slide:
+            box = items_by_node[open_node[0]]
+            middle = view.mapFromScene(box.mapToScene(box.rect().center())).x()
+            toward = -1 if middle < panel_rect().center().x() else 1
+        stop_retract()
+        if info_panel.isHidden():
+            return
+        picture = QLabel(view.viewport())
+        shown = panel_rect()   # the panel as big as the map has it now
+        picture.setPixmap(info_panel.grab().scaled(shown.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
+        picture.setGeometry(shown)
+        picture.setAttribute(Qt.WA_TransparentForMouseEvents)
+        picture.setStyleSheet("background: transparent;")
+        effect = QGraphicsOpacityEffect(picture)
+        picture.setGraphicsEffect(effect)
+        picture.show()
+        picture.raise_()
+        info_proxy.setOpacity(1.0)
+        info_panel.hide()
+        start = picture.pos()
         end = start + QPoint(toward * INFO_RETRACT, 0)
-        effect = QGraphicsOpacityEffect(info_panel)
-        info_panel.setGraphicsEffect(effect)
-        view.info_closing = info_panel
-        motion = QVariantAnimation(info_panel)
-        motion.setDuration(INFO_RETRACT_MS)
+        view.info_closing = picture
+        motion = QVariantAnimation(picture)
+        motion.setDuration(INFO_RETRACT_MS if slide else ANIMATION_MS)
         motion.setStartValue(0.0)
         motion.setEndValue(1.0)
         motion.setEasingCurve(QEasingCurve.InCubic)
 
         def step(t):
-            info_panel.move(round(start.x() + (end.x() - start.x()) * t), start.y())
+            picture.move(round(start.x() + (end.x() - start.x()) * t), start.y())
             effect.setOpacity(1.0 - t)
             follow_info()
 
@@ -9315,22 +9909,26 @@ def render_node_graph(view, frame):
                 return
             retracting[0] = None
             view.info_closing = None
-            info_panel.setGraphicsEffect(None)
-            info_panel.hide()
+            picture.deleteLater()
             follow_info()
 
         motion.valueChanged.connect(step)
         motion.finished.connect(finished)
+        motion.picture = picture
         retracting[0] = motion
         motion.start(QAbstractAnimation.DeleteWhenStopped)
 
-    # opened again while it was being drawn back: it stays, whole
+    # opened again while it was being drawn back: the picture goes, and the
+    # panel is shown again by whoever opened it
     def stop_retract():
         motion, retracting[0] = retracting[0], None
         if motion is not None:
-            motion.stop()
             view.info_closing = None
-            info_panel.setGraphicsEffect(None)
+            try:
+                motion.picture.deleteLater()
+                motion.stop()
+            except RuntimeError:
+                pass   # finished and deleted already
 
     # a click on the box itself: it picks the node out and nothing more -
     # clicking the picked one again puts it back. The panel is the caret's.
@@ -9346,20 +9944,43 @@ def render_node_graph(view, frame):
         stop_retract()
         moving_over = info_open[0]
         info_dragged[0] = False    # opened on a node: it hangs off that node again
+        info_side[0] = None        # ...on whichever side has room
         info_panel.set_detached(False)
         set_picked(node)
         info_open[0] = True
         opened = getattr(view, "on_info_opened", None)   # the manager keeps to it, or shuts
         if opened is not None:
             opened(node)
-        info_panel.set_node(node, recorded[node])
+        info_panel.set_node(node, recorded.get(node, {}))
         position_info_panel(item)
         refresh_info_buttons()
         if moving_over:
-            pulse(info_panel)      # moved over to another node: its new content flashes in
+            fade_info(INFO_PULSE_LOW)   # moved over to another node: its new content flashes in
         else:
-            fade_in(info_panel)
+            fade_info(0.0)
         follow_info()   # showing now: the recipe manager's tab comes out by it
+
+    # shown, coming up from `low` to whole - faded as the item in the graph
+    # it is, not through an effect on the widget inside it
+    fading = [None]
+
+    def fade_info(low):
+        running, fading[0] = fading[0], None
+        if running is not None:
+            try:
+                running.stop()
+            except RuntimeError:
+                pass
+        info_panel.show()
+        info_proxy.setOpacity(low)
+
+        def step(value):
+            try:
+                info_proxy.setOpacity(float(value))
+            except RuntimeError:
+                pass   # the scene was drawn over meanwhile
+
+        fading[0] = animate_value(view, low, 1.0, step, ANIMATION_MS)
 
     # Opened on `node` from outside - after a rebuild, on the node it stood
     # open on before - at `spot` when it had been dragged there, without any
@@ -9371,15 +9992,15 @@ def render_node_graph(view, frame):
         stop_retract()
         set_picked(node)
         info_open[0] = True
-        info_panel.set_node(node, recorded[node])
+        info_panel.set_node(node, recorded.get(node, {}))
         position_info_panel(item)
         info_panel.set_detached(spot is not None)
         if spot is not None:
             info_dragged[0] = True
             move_info(spot)
         refresh_info_buttons()
+        info_proxy.setOpacity(1.0)
         info_panel.show()
-        info_panel.raise_()
         follow_info()
         return True
 
@@ -9392,6 +10013,29 @@ def render_node_graph(view, frame):
 
     view.open_node_info = open_info_on
     view.info_node = lambda: open_node[0] if info_open[0] else None
+
+    # which side of its box the panel stands on - read off where it is, so it
+    # says the same for a panel put there by hand as for one hung there - or
+    # None with no box picked. What the recipe manager opens away from.
+    def info_box_side():
+        item = items_by_node.get(open_node[0])
+        if item is None:
+            return None
+        middle = view.mapFromScene(item.mapToScene(item.rect().center())).x()
+        try:
+            return "left" if info_rect().center().x() < middle else "right"
+        except RuntimeError:
+            return None
+
+    # the panel on screen, as a rect of the view's - or the picture of it
+    # drawing back while it shuts - for what is laid out beside it
+    def info_rect():
+        closing = getattr(view, "info_closing", None)
+        return closing.geometry() if closing is not None else panel_rect()
+
+    view.info_box_side = info_box_side
+    view.info_rect = info_rect
+    view.info_spot = panel_pos
     view.info_was_dragged = lambda: info_dragged[0]
     # A scene drawn over the last throws its info panel away, open or not,
     # with nothing shutting it: whatever stood by it - the recipe manager's
@@ -9408,16 +10052,12 @@ def render_node_graph(view, frame):
                 item.refresh_glow()
 
     view.view_changed_callbacks.append(hold_glows)
-    # More info opened or shut: as tall as what it now says - hung off its
-    # box again, or, dragged away from it, left where it was put
+    # More info opened or shut: as tall as what it now says, left where it stands
     def resize_info():
         if not info_open[0] or open_node[0] not in items_by_node:
             return
-        if not info_dragged[0]:
-            reposition_info()
-            return
         fit_info_height()
-        move_info(info_panel.pos())   # kept inside the view, the manager following
+        reposition_info()   # a panel on its left side hangs by its width: put back against the box
 
     info_panel.on_resize = resize_info
 
@@ -9439,12 +10079,47 @@ def render_node_graph(view, frame):
     def toggle_done(node):
         key = node_key(node)
         done.discard(key) if key in done else done.add(key)
-        for other, box in items_by_node.items():
-            if isinstance(box, NodeItem) and node_key(other) == key:
-                box.set_done(key in done)
+        show_done()
         if info_open[0] and open_node[0] is node:
             info_panel.set_node(node, recorded[node])   # its button says the other thing now
         schedule_save()
+
+    # What can be ticked off: a recipe, once, whatever merged into it - the
+    # same count the hub's card reads (see project_summary)
+    def done_keys():
+        return {node_key(node) for node in nodes if isinstance(node, Recipe_Node) and node.merged_into is None}
+
+    # the whole project standing in the world: every one of them ticked off
+    def all_done():
+        keys = done_keys()
+        return bool(keys) and keys <= done
+
+    # Each box green while it is ticked off - until every one of them is: the
+    # project is complete then, and its boxes go back to their own colors
+    # rather than leaving the whole map green. Whoever says so is told.
+    def show_done():
+        whole = all_done()
+        for node, box in items_by_node.items():
+            if isinstance(box, NodeItem):
+                box.set_done(can_be_built(node) and node_key(node) in done and not whole)
+        changed = getattr(view, "on_done_changed", None)
+        if changed is not None:
+            changed()
+
+    # every box ticked off at once, or none of them
+    def set_all_done(on):
+        keys = done_keys()
+        if on:
+            done.update(keys)
+        else:
+            done.difference_update(keys)
+        show_done()
+        if info_open[0] and open_node[0] in recorded:
+            info_panel.set_node(open_node[0], recorded[open_node[0]])
+        schedule_save()
+
+    view.all_done = all_done
+    view.set_all_done = set_all_done
 
     # a dragged machine takes its power line with it, and the power node rides
     # a block above whatever is now the highest box on the map. `rail`, while
@@ -9465,20 +10140,34 @@ def render_node_graph(view, frame):
             power_item[0].setPos(corner)
             power_item[0].node.coordinate = (corner.x(), corner.y())
         feed = {side: power_item[0].feed_point(side) for side in (True, False)}
+        # every line on a lane of its own, the way the hub's run (see power_lanes)
+        ends = {}
         for machine, line in power_line_of.items():
             box = items_by_node[machine]
-            line.set_ends(QPointF(box.pos().x() + power_arrow_x(line.feeding, box.rect().width()),
-                                  box.pos().y()), rail,
+            ends[line] = (QPointF(box.pos().x() + power_arrow_x(line.feeding, box.rect().width()), box.pos().y()),
                           feed[line.feeding])
         for pump, line in pump_lines:
+            ends[line] = (pump.power_top(), feed[False])
+        lanes = power_lanes(ends, rail, power_item[0].pos().y() + POWER_NODE_HEIGHT)
+        for machine, line in power_line_of.items():
+            line.set_lane(ends[line][0], lanes[line], ends[line][1])
+        for pump, line in pump_lines:
             line.rail_y_wanted = rail
-            line.set_ends(pump.power_top(), rail, feed[False], tuck=PUMP_LINE_TUCK)
+            line.set_lane(ends[line][0], lanes[line], ends[line][1], tuck=PUMP_LINE_TUCK)
+
+    # an extraction box moved by hand: its source node, bolted to it, with it
+    def carry_source(moved):
+        source = getattr(moved.node, "source_node", None)
+        box = items_by_node.get(source) if source is not None else None
+        if box is not None:
+            box.setPos(*source_spot((moved.pos().x(), moved.pos().y())))
 
     def node_moved(moved=None):
         # a transition drops the whole scene while its boxes are still gliding,
         # so a move can arrive after the items behind it are gone
         try:
             if moved is not None:
+                carry_source(moved)
                 restack_ports(moved)
                 schedule_save()   # where a box was dragged to is worth keeping
             reposition_info()
@@ -9507,6 +10196,20 @@ def render_node_graph(view, frame):
                 scene.addItem(power_item[0])
                 items_by_node[node] = power_item[0]
             continue
+        if isinstance(node, search.Source_Node):
+            box = SourceBox(node, view, pick_node, node_moved, toggle_info)
+            box.setPos(*node.coordinate)
+            if not legacy_arrows:
+                # the one port it has: its item, out of its right side
+                arrow = QGraphicsPolygonItem(flow_arrow_points(box.rect().width(), 0, port_slot_height(1)), box)
+                arrow.setPos(0, port_slot_y(0, 1))
+                arrow.setPen(Qt.NoPen)
+                arrow.setBrush(box.color)
+                box.port_arrows["out"].append(arrow)
+                box.texts.append(arrow)
+            scene.addItem(box)
+            items_by_node[node] = box
+            continue
         item = NodeItem(node_width(), NODE_HEIGHT, node, pick_node, node_moved)
         item.setPos(*node.coordinate)
         item.accents = accents.get(node)
@@ -9516,8 +10219,9 @@ def render_node_graph(view, frame):
         border_color = node_border_color(node)
         focused = node is focus
         item.setPen(QPen(QColor(border_color), NODE_FOCUS_BORDER_WIDTH if focused else NODE_BORDER_WIDTH))
-        item.setBrush(QBrush(NODE_DONE_BG) if node_key(node) in done else node_brush)
-        item.on_complete = toggle_done
+        built = can_be_built(node)
+        item.setBrush(QBrush(NODE_DONE_BG) if built and node_key(node) in done else node_brush)
+        item.on_complete = toggle_done if built else None
         item.focus_glow = focused   # the build's own light, not to be put out by a pick
         if focused:
             item.lit_level = 1.0    # lit the same way a picked box is
@@ -9537,6 +10241,7 @@ def render_node_graph(view, frame):
         # reference kept somewhere, each child item is garbage collected the
         # moment the loop variable is reassigned, vanishing from the node
         item.texts = []
+
 
         # the caret that opens this node's info, in its top right corner: the
         # panel is shut until it is pressed (see toggle_info). A compact box
@@ -10105,8 +10810,7 @@ def render_node_graph(view, frame):
                     power_lines.append(line)
                     pump.power_line = line
                     pump_lines.append((pump, line))
-                    pump.on_moved = lambda pump=pump, line=line: line.set_ends(
-                        pump.power_top(), line.rail_y_wanted, power_item[0].feed_point(False), tuck=PUMP_LINE_TUCK)
+                    pump.on_moved = lambda line=line: reflow_power(line.rail_y_wanted)
                     # the one just put there pops in
                     if getattr(view, "pump_landing", None) == (key, index):
                         view.pump_landing = None
@@ -10133,6 +10837,12 @@ def render_node_graph(view, frame):
     # stand, and the height they turn at: what a transition eases them by
     scene.reflow_power = reflow_power
     scene.power_rail = rail_y if power_item[0] is not None else None
+    if power_item[0] is not None:
+        reflow_power(rail_y)   # every line on its lane from the first frame
+    show_done()   # a complete project's boxes in their own colors from the first frame
+    for (mother, daughter), edge in edge_items.items():
+        if isinstance(daughter, search.Source_Node):
+            edge.set_source_look(resource_color(daughter.item))
     scene.edge_items = edge_items
     scene.edge_rates = edge_rates
     scene.values = recorded
@@ -10767,6 +11477,16 @@ OUTPUT_CAPTION_COLOR = TEXT_FAINT  # "Recipe", "/min": the small labels of an ou
 OUTPUT_CARD_BG = "#252525"        # an output's card, a shade off the panel so each reads as one
 OUTPUT_CARD_PADDING = 10
 OUTPUT_TILE_PADDING = 6          # a compact card's, tighter: two of them share a row
+OUTPUT_GRIP_HEIGHT = 14          # the dotted strip along a card's top it is dragged by
+OUTPUT_GRIP_TOP = 2              # room over the strip: it stands in for the card's top padding
+
+# The dotted strip along a card's top, as on the info panel: the one part of
+# a card it is taken hold of by (see CardDrag), the rest of it left to its
+# fields, its buttons and its words
+def card_grip():
+    grip = PanelGrip()
+    grip.setFixedHeight(OUTPUT_GRIP_HEIGHT)
+    return grip
 OUTPUT_TILE_COLUMNS = 2          # compact cards side by side, then on to the next row
 SEARCH_TAKEN_COLOR = TEXT_DISABLED          # an item already picked, greyed out in the list
 SEARCH_TAKEN_TOOLTIP = "Already added"
@@ -11336,12 +12056,15 @@ def make_output_row(item, recipe=None, on_recipe_change=None, start=None, on_rat
         "}"
     )
     row_layout = QVBoxLayout(row)
-    row_layout.setContentsMargins(OUTPUT_CARD_PADDING, OUTPUT_CARD_PADDING,
+    row_layout.setContentsMargins(OUTPUT_CARD_PADDING, OUTPUT_GRIP_TOP,
                                   OUTPUT_CARD_PADDING, OUTPUT_CARD_PADDING)
     row_layout.setSpacing(4)
+    row.grip = card_grip()
+    row_layout.addWidget(row.grip)
 
     header = QWidget()
     header.setObjectName("output_header")
+    row.header = header   # its ground past the name is a handle too (see CardDrag)
     header_layout = QHBoxLayout(header)
     header_layout.setContentsMargins(0, 0, 0, 0)
     header_layout.setSpacing(4)
@@ -11356,8 +12079,8 @@ def make_output_row(item, recipe=None, on_recipe_change=None, start=None, on_rat
             return machine_picture(recipe.machine[0])
         return item_picture(item)
 
-    picture = picture_label(card_picture(recipe), OUTPUT_PICTURE_SIZE)
-    row.picture = picture   # what a compact tile is dragged by
+    picture = picture_label(card_picture(recipe), OUTPUT_PICTURE_SIZE, steady=True)
+    row.picture = picture
 
     label = selectable(QLabel(item.display_name))
     label.setStyleSheet(f"color: {OUTPUT_NAME_COLOR}; font-size: {PANEL_FONT_SIZE}px; font-weight: bold;")
@@ -11365,8 +12088,7 @@ def make_output_row(item, recipe=None, on_recipe_change=None, start=None, on_rat
     remove_button = make_remove_output_button()
     remove_button.setToolTip("Remove this output")
 
-    # the name only as wide as it is: the room after it is the card's own
-    # ground, and a card is held by its ground (see CardDrag)
+    # the name on the left, the cross taking the card off on the right
     header_layout.addWidget(label)
     header_layout.addStretch(1)
     header_layout.addWidget(remove_button)
@@ -11812,14 +12534,13 @@ def make_output_row(item, recipe=None, on_recipe_change=None, start=None, on_rat
         show_boost()   # out of a tile, its boost said again
         if on:
             value_row.removeWidget(picture)
-            row_layout.insertWidget(0, picture, 0, Qt.AlignHCenter)
+            row_layout.insertWidget(1, picture, 0, Qt.AlignHCenter)   # under the grip
             padding = OUTPUT_TILE_PADDING
         else:
             row_layout.removeWidget(picture)
             value_row.insertWidget(0, picture)
             padding = OUTPUT_CARD_PADDING
-        row_layout.setContentsMargins(padding, padding, padding, padding)
-        picture.setCursor(Qt.OpenHandCursor if on else Qt.ArrowCursor)
+        row_layout.setContentsMargins(padding, OUTPUT_GRIP_TOP, padding, padding)
         set_tip()
 
     row.set_compact = set_compact
@@ -11851,12 +12572,15 @@ def make_consumer_row(building, start=None, on_rate_change=None):
         "}"
     )
     row_layout = QVBoxLayout(row)
-    row_layout.setContentsMargins(OUTPUT_CARD_PADDING, OUTPUT_CARD_PADDING,
+    row_layout.setContentsMargins(OUTPUT_CARD_PADDING, OUTPUT_GRIP_TOP,
                                   OUTPUT_CARD_PADDING, OUTPUT_CARD_PADDING)
     row_layout.setSpacing(4)
+    row.grip = card_grip()
+    row_layout.addWidget(row.grip)
 
     header = QWidget()
     header.setObjectName("output_header")
+    row.header = header   # its ground past the name is a handle too (see CardDrag)
     header_layout = QHBoxLayout(header)
     header_layout.setContentsMargins(0, 0, 0, 0)
     header_layout.setSpacing(4)
@@ -11868,7 +12592,7 @@ def make_consumer_row(building, start=None, on_rate_change=None):
     header_layout.addStretch(1)
     header_layout.addWidget(remove_button)
 
-    picture = picture_label(power_building_picture(building), OUTPUT_PICTURE_SIZE)
+    picture = picture_label(power_building_picture(building), OUTPUT_PICTURE_SIZE, steady=True)
     row.picture = picture
 
     value = [max(0, round(start if start is not None else 1))]
@@ -11980,14 +12704,13 @@ def make_consumer_row(building, start=None, on_rate_change=None):
             widget.setVisible(not on)
         if on:
             value_row.removeWidget(picture)
-            row_layout.insertWidget(0, picture, 0, Qt.AlignHCenter)
+            row_layout.insertWidget(1, picture, 0, Qt.AlignHCenter)   # under the grip
             padding = OUTPUT_TILE_PADDING
         else:
             row_layout.removeWidget(picture)
             value_row.insertWidget(0, picture)
             padding = OUTPUT_CARD_PADDING
-        row_layout.setContentsMargins(padding, padding, padding, padding)
-        picture.setCursor(Qt.OpenHandCursor if on else Qt.ArrowCursor)
+        row_layout.setContentsMargins(padding, OUTPUT_GRIP_TOP, padding, padding)
         set_tip()
 
     show_draw()
@@ -12596,9 +13319,8 @@ def make_recipe_manager(view):
             return None   # the panel of a scene drawn over since
 
     # Where everything stands, `state["progress"]` of the way out: the
-    # manager slid out of the info panel's side by that much - against its
-    # right side, or its left when the map has no room there, level with its
-    # top - what is still over the panel hidden behind it, and the tab
+    # manager slid out of the info panel's side by that much - the side away
+    # from the panel's box, level with its top - what is still over the panel hidden behind it, and the tab
     # reaching out along its top to its far edge. With no info panel open (a
     # rebuild being played through) it stays where it last stood, the tab
     # with it. The tab shows while the manager is out, and on any box whose
@@ -12613,8 +13335,11 @@ def make_recipe_manager(view):
         level = state["progress"]
         info = info_open()
         if info is not None:
-            beside = info.geometry()
-            side = "right" if beside.right() + width <= viewport.width() - NODE_INFO_MARGIN else "left"
+            beside = getattr(view, "info_rect", info.geometry)()
+            # out on the far side of the panel from its box - left of a panel
+            # hung on the box's left, right of one on its right - always: the
+            # panel is part of the map, and the other side is over the box
+            side = getattr(view, "info_box_side", lambda: None)() or "right"
             edge = beside.right() if side == "right" else beside.left()
             top = beside.top()
             info_item = managed_item(view.info_node())
@@ -12638,8 +13363,8 @@ def make_recipe_manager(view):
             shown_part = max(1, out)
             panel.setMask(QRegion(QRect(width - shown_part, 0, shown_part, height) if right
                                   else QRect(0, 0, shown_part, height)))
-        if info is not None:
-            panel.stackUnder(info)
+        if info is not None and info.parentWidget() is panel.parentWidget():
+            panel.stackUnder(info)   # the picture of it drawing back; the panel itself is in the graph
         else:
             panel.raise_()
         state["spot"], state["side"] = QPoint(final_x, y), side
@@ -14270,11 +14995,27 @@ def make_side_panel(on_confirm):
         layout.activate()   # the cells the next drag is judged by
         for entry in entries:
             row = entry["row"]
-            row.cell = row.geometry()   # where it belongs, whatever it is shown at
+            cell = cell_of(entry)
             old = before.get(id(entry))
-            if entry is held or old is None or old == row.cell:
+            if entry is held or old is None or old == cell:
                 continue
-            slide_card(row, old, row.cell)
+            slide_card(row, old, cell)
+
+    # Where a card belongs, whatever it is shown at: its cell, read from the
+    # grid as it stands now. Not kept from the last relay - a card unrolling
+    # in, or one rolling up out of the list, moves every cell under it after
+    # that, and a card judged by, or set down into, a cell kept from before
+    # passed the others by without taking their place and was let go into
+    # where another now stands, hidden under it.
+    def cell_of(entry):
+        row = entry["row"]
+        layout = pages[entry["side"]].layout()
+        index = layout.indexOf(row)
+        if index < 0:
+            return row.geometry()
+        at, column, _, _ = layout.getItemPosition(index)
+        cell = layout.cellRect(at, column)
+        return cell if cell.isValid() else row.geometry()
 
     def stop_slide(row):
         running, row.slide = getattr(row, "slide", None), None
@@ -14346,8 +15087,8 @@ def make_side_panel(on_confirm):
         roll_up(entry["row"], drop)
 
     # A full card follows the cursor up and down its list only - sideways it
-    # pays no heed. A compact tile is held by its
-    # picture and goes wherever in the grid the cursor takes it. Either takes
+    # pays no heed. A compact tile goes wherever in the grid the cursor takes
+    # it. Either takes
     # the place of the card the cursor comes over, the others shifting along
     # to make room, and the build reads the cards in the order they end up in.
     #
@@ -14355,8 +15096,15 @@ def make_side_panel(on_confirm):
     # accent, and only takes another's place once it is itself more than half
     # way past that one - the one it passes sliding over into the room it
     # leaves. Let go, it glides into its cell.
-    # It is held by any of its own ground - everything on it that is not a
-    # field, a button or its name - and as a tile by its picture too.
+    # It is held by the dotted strip along its top (see card_grip), or by its
+    # heading's ground past the name, and nothing else - and not at all while
+    # the graph is locked: the order is part of
+    # what the build reads, and a locked graph is not built again.
+    #
+    # Whether it has come over another is judged by where the cards belong -
+    # their cells - not where they are shown: one sliding out of the way
+    # stood, for the first frames of its slide, where the held card was, and
+    # the two swapped back and forth there, the cards jittering.
     class CardDrag(QObject):
         def __init__(self, entry, parent):
             super().__init__(parent)
@@ -14377,8 +15125,8 @@ def make_side_panel(on_confirm):
         # card's own middle - coming from its cell: along the column for cards
         # one over the other, along the row for tiles side by side
         def past_middle(self, other, at):
-            cell = getattr(self.entry["row"], "cell", self.entry["row"].geometry())
-            spot = other["row"].geometry()
+            cell = cell_of(self.entry)
+            spot = cell_of(other)
             middle = spot.center()
             after = added_outputs.index(other) > added_outputs.index(self.entry)
             # a little before the middle is enough: it reads as the card
@@ -14398,7 +15146,8 @@ def make_side_panel(on_confirm):
         # that never arrived is noticed (see let_go).
         def set_held(self, held):
             row = self.entry["row"]
-            row.setMouseTracking(held)
+            row.grip.setMouseTracking(held)
+            row.header.setMouseTracking(held)
             if held:
                 # its look at rest kept once: lifted again before it was set
                 # down, it must not take the outline for its look at rest
@@ -14412,11 +15161,10 @@ def make_side_panel(on_confirm):
 
         def eventFilter(self, watched, event):
             row = self.entry["row"]
-            # the picture is only a handle on a tile; on a full card it is a picture
-            if watched is row.picture and not row.compact:
-                return False
             kind = event.type()
             if kind == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                if panel_options["locked"]:
+                    return True   # held in place by the lock
                 self.press = event.globalPosition()
                 self.grab = row.mapFromGlobal(event.globalPosition().toPoint())
                 self.dragging = False
@@ -14463,7 +15211,7 @@ def make_side_panel(on_confirm):
             row = self.entry["row"]
             page = row.parentWidget()
             at = page.mapFromGlobal(self.cursor)
-            cell = getattr(row, "cell", row.geometry())
+            cell = cell_of(self.entry)
             x = cell.x() if not row.compact else at.x() - self.grab.x()
             y = at.y() - self.grab.y()
             x = max(0, min(x, page.width() - row.width()))
@@ -14472,7 +15220,7 @@ def make_side_panel(on_confirm):
             middle = QRect(x, y, row.width(), row.height()).center()
             over = next((other for other in added_outputs
                          if other is not self.entry and other["side"] == self.entry["side"]
-                         and other["row"].geometry().contains(middle)
+                         and cell_of(other).contains(middle)
                          and self.past_middle(other, middle)), None)
             if over is not None:
                 self.take_place_of(over)
@@ -14493,12 +15241,21 @@ def make_side_panel(on_confirm):
                 edge.deleteLater()
                 self.edge = None
             moved, self.dragging, self.press = self.dragging, False, None
-            watched.setCursor(Qt.OpenHandCursor)
+            show_grip(row)
             if moved:
                 self.set_held(False)
-                slide_card(row, row.geometry(), getattr(row, "cell", row.geometry()))
+                slide_card(row, row.geometry(), cell_of(self.entry))
                 refresh_confirm()   # the order is part of what the build reads
                 schedule_save()
+
+    # the strip's cursor and tip: something to take hold of, or held by the lock
+    def show_grip(row):
+        locked = panel_options["locked"]
+        row.grip.grabbable = not locked   # its dots gone: nothing to take hold of
+        row.grip.update()
+        for handle in (row.grip, row.header):
+            handle.setCursor(Qt.ArrowCursor if locked else Qt.OpenHandCursor)
+            handle.setToolTip(LOCKED_TOOLTIP if locked else "Drag to move")
 
     # one card, on whichever list it belongs to
     def add_card(item, recipe, side, start=None, shares=None):
@@ -14519,13 +15276,16 @@ def make_side_panel(on_confirm):
         added_outputs.append(entry)
         remove_button.clicked.connect(lambda: remove_output(entry))
         row.drag = CardDrag(entry, row)   # kept alive by the card
-        row.picture.installEventFilter(row.drag)
-        row.installEventFilter(row.drag)   # its own ground: anywhere nothing else takes the press
-        row.setCursor(Qt.OpenHandCursor)
+        # held by its strip, or by its heading's ground past the name - the
+        # name itself is text to select, the cross a button, and both keep
+        # their own presses
+        row.grip.installEventFilter(row.drag)
+        row.header.installEventFilter(row.drag)
         row.set_compact(compact[0])
         relay(side)
         paint_accent(row)   # made after a switch: it takes the accent as it stands
         row.setEnabled(not panel_options["locked"])
+        show_grip(row)
         refresh_used(item)
         refresh_confirm()
         unroll(row)   # the card unrolls into the list rather than popping in
@@ -14988,6 +15748,7 @@ def make_side_panel(on_confirm):
             [entry for entry in added_outputs if entry["side"] == current[0]]))
         for entry in added_outputs:
             entry["row"].setEnabled(not locked)
+            show_grip(entry["row"])
         refresh_confirm()   # the build button: held by the lock, or by a card's rates
 
     refresh_confirm()   # the button starts with its own word and glyph on it
@@ -14996,24 +15757,6 @@ def make_side_panel(on_confirm):
     panel.refresh_confirm = refresh_confirm
     panel.sync_options = sync_options
 
-    # The cards of both lists put in the order `rank(item, recipe)` gives -
-    # the order their outputs stand in on the map - each sliding to its new
-    # place. What the last build read is put in the same order, so a card
-    # moved only to follow the map is not a change waiting to be built.
-    def sort_cards(rank):
-        added_outputs.sort(key=lambda entry: rank(entry["item"], entry["get_recipe"]()))
-
-        def saved_rank(card):
-            name = card["item"]
-            item = POWER_ITEM if POWER_ITEM is not None and name == POWER_ITEM.full_name else All_Items.get(name)
-            return rank(item, All_Recipes.get(card["recipe"]))
-
-        baseline.sort(key=saved_rank)
-        for side in PANEL_TAB_SIDES:
-            relay(side)
-        refresh_confirm()
-
-    panel.sort_cards = sort_cards
     panel.cards = lambda: list(added_outputs)   # what is asked for, for the save file
     panel.current_side = lambda: current[0]     # which list is open: the accent follows it
 
@@ -15119,18 +15862,20 @@ def make_side_panel(on_confirm):
 # that no card is standing on: the "New project" card always shows where.
 HOME_CARD_WIDTH = GRID_SQUARE * 5          # 600: whole squares, so a snapped card sits flush
 HOME_CARD_HEIGHT = GRID_SQUARE * 3         # 360
+HOME_CARD_INPUT_ROW = GRID_SQUARE          # a project's second row of pictures: what it takes in
+HOME_CARD_ARROW_ROOM = GRID_STEP           # under everything, the room its input arrows stand in
+HOME_PROJECT_HEIGHT = HOME_CARD_HEIGHT + HOME_CARD_INPUT_ROW + HOME_CARD_ARROW_ROOM   # a project's card, with them
 HOME_CARD_PITCH_X = GRID_SQUARE * 7        # card to card across: two squares of air between
 HOME_CARD_GAP_X = HOME_CARD_PITCH_X - HOME_CARD_WIDTH   # that air, after a card however wide it is
-HOME_CARD_PITCH_Y = GRID_SQUARE * 5        # ...and down: room for the power lines to climb through
 HOME_SLIDE_MS = 300                        # cards gliding to their new spots
 HOME_GRAB_SCALE = 1.06                     # a card picked up stands a little bigger...
 HOME_GRAB_MS = 130                         # ...lifting and settling over this long
 HOME_GRAB_SHADOW = 60                      # and throws a shadow, this soft
 HOME_FADE_MS = 260                         # a new project's card coming in
-HOME_PAGE_LABEL_SIZE = 40                  # "Page 2", left of its row
-HOME_PAGE_LABEL_WIDTH = GRID_SQUARE * 2
-HOME_CARDS_PER_LINE = 4                    # a page longer than this goes on over the lines under it
-HOME_HUB_GAP = GRID_SQUARE * 3             # from the power node down to the first row
+HOME_PAGE_LABEL_SIZE = 40                  # "Page 2", before its page's first card
+HOME_PAGE_LABEL_WIDTH = GRID_SQUARE * 1.5
+HOME_PAGE_LABEL_GAP = GRID_SQUARE / 2      # from a page's label to its first card, and the last card before it
+HOME_HUB_GAP = GRID_SQUARE * 6             # from the power node down to the cards: room for the lines' lanes
 HOME_HUB_SPOT = (-POWER_NODE_WIDTH / 2, -HOME_HUB_GAP - POWER_NODE_HEIGHT)   # with no card to stand over
 HOME_CARD_HEADER = 104                     # the band in the project's own color, its name on it
 HOME_CARD_PAD = 30
@@ -15147,8 +15892,16 @@ HOME_CARD_SPLIT_TOP = 280                  # what makes up the net, under it: ma
 HOME_CARD_BAR_TOP = 322
 HOME_CARD_BAR_HEIGHT = 14
 HOME_CARD_BAR_TEXT_WIDTH = 150
+HOME_CARD_BUILT_TEXT_WIDTH = 170          # a project's "12/34 built": the same room whatever it says
 HOME_CARD_BAR_BG = "#2b2b2b"
+HOME_CARD_INPUT_DIVIDER = "#555555"
+HOME_CARD_ROW_LABEL = 84                   # "OUT" and "IN" before the two rows of pictures
+HOME_CARD_ROW_LABEL_SIZE = 28        # the faint line between what a project makes and what it takes in
+HOME_CARD_INPUT_DIVIDER_GAP = 10           # ...this far over the second row's pictures
 HOME_CARD_BUILT_COLOR = NODE_OUTPUT_BORDER_COLOR   # the green a box ticked off as built goes
+HOME_CARD_COMPLETE_COLOR = "#8a8a8a"               # ...and the grey of a project all built
+HOME_CARD_COMPLETE_BOX = 40                        # the box ticking a project complete, before its bar's words
+HOME_CARD_COMPLETE_GAP = 8                         # ...and the room between them
 HOME_CARD_PLAIN_COLOR = "#5c5c5c"          # an uncolored project's band and outline
 HOME_CARD_LAST_WIDTH = 7                   # the project open last: a heavier outline
 HOME_CARD_POWER_GAP = 24                   # between what a project makes and what it draws
@@ -15159,11 +15912,16 @@ HOME_GHOST_PLUS_WIDTH = 9
 HOME_GHOST_GAP = 22                        # between the cross and its words
 HOME_GHOST_DASH = 7                        # its dashed outline's dashes and gaps, in pen widths
 HOME_COG_OVERLAY = "#0effffff"             # the cog over the grid: white, at a whisper
-HOME_HUB_COG_RADIUS = GRID_SQUARE * 6      # ...in the hub's middle, never smaller than this on the map
+HOME_HUB_COG_RADIUS = GRID_SQUARE * 8      # ...in the hub's middle, never smaller than this on the map
+HOME_HUB_COG_SIZE = 0.8                    # ...and across, this much of the height the hub takes up
 HOME_LABEL_SIZE = 12
 HOME_MENU_BUTTON = 64                      # the "..." in a card's band that opens its menu
 HOME_MENU_BUTTON_ALPHA = 46                # its soft ground, under the mouse
 HOME_CARD_OFF_OPACITY = 0.4                # a project switched off on the hub: faded out
+HOME_SWITCH_MS = 240                       # ...fading there or back, its switch sliding over
+HOME_SWITCH_OFF_TRACK = QColor(0, 0, 0, 80)  # the switch's track while it is off
+HOME_SWITCH_KNOB = "#ffffff"
+HOME_SWITCH_ON_TRACK = "#bcbcbc"            # ...and while it is on: a bright grey, the white knob over it
 HOME_VERSION_BG = QColor(37, 37, 37, 217)    # the game version, in the hub's corner: 85% opaque
 HOME_VERSION_PAD = (10, 5)                   # its words from its edges, across and down
 
@@ -15172,7 +15930,8 @@ HOME_VERSION_PAD = (10, 5)                   # its words from its edges, across 
 # one): HOME_CARD_WIDTH, or for more than fit in that, just wide enough for
 # them - out to the next fine line of the grid, so its edges still sit on one
 def home_card_width(count):
-    needed = 2 * HOME_CARD_PAD + count * HOME_CARD_PICTURE + max(count - 1, 0) * HOME_CARD_PICTURE_GAP
+    needed = (2 * HOME_CARD_PAD + HOME_CARD_ROW_LABEL + count * HOME_CARD_PICTURE
+              + max(count - 1, 0) * HOME_CARD_PICTURE_GAP)
     return max(HOME_CARD_WIDTH, math.ceil(needed / GRID_STEP) * GRID_STEP)
 
 # a project's cards as the save file has them, back into items and recipes -
@@ -15189,6 +15948,45 @@ def outputs_from_saved(cards):
                             "recipe": recipe if recipe in item.recipes else None})
     return outputs
 
+# The resource nodes `page` has assigned to what it digs out, as a build
+# reads them (see search.EXTRACTION_SITES): {item: [(extractor, rate, rate
+# at 100%)]}, in the hub's order
+def extraction_sites(page):
+    uid = getattr(page, "uid", None)
+    sites = {}
+    if uid is None:
+        return sites
+    for node in RESOURCES["nodes"]:
+        if uid in node.links:
+            sites.setdefault(node.item, []).append((node.extractor, node.wanted(uid), node.base_capacity()))
+    return sites
+
+# what every build of `page`'s tree is made with: the miner the options pick,
+# and the resource nodes it has
+def prepare_build(page):
+    set_miner_mark(panel_options["miners_mark"])
+    search.set_extraction_sites(extraction_sites(page))
+
+# a box digging something out of the ground: a recipe taking nothing in
+def is_extraction(node):
+    return (isinstance(node, Recipe_Node) and node.merged_into is None and not node.recipe.ingredients
+            and node.needed_item is not POWER_ITEM)
+
+# The nodes a project has were changed: its extraction boxes stood on them
+# again - their machines, how many, what they draw - without building the
+# tree again, nothing else of it changing. The step's own record of their
+# counts with them.
+def restand_extractions(page, steps):
+    if not steps:
+        return
+    search.set_extraction_sites(extraction_sites(page))
+    final = steps[-1]
+    for node in final["nodes"]:
+        if is_extraction(node):
+            node.recalculate()
+            if node in final["values"]:
+                final["values"][node]["machine_nb"] = node.machine_nb
+
 # The tree a project not opened yet would build: worked out from what it asks
 # for without laying it out or drawing it, which is the part that takes the
 # time. Kept on the page until what it asks for, or the options it is built
@@ -15198,12 +15996,16 @@ def unloaded_tree(page):
     if not saved.get("built"):
         return None
     options = saved_options()
+    sites = sorted((item.full_name, [(machine.full_name, round(capacity, 4), round(base, 4))
+                                     for machine, capacity, base in spots])
+                   for item, spots in extraction_sites(page).items())
     key = json.dumps([saved.get("outputs"), saved.get("pumps"), options["miners_mark"],
-                      options["recipe_choices"], options["node_recipe_choices"]], sort_keys=True, default=str)
+                      options["recipe_choices"], options["node_recipe_choices"], sites],
+                     sort_keys=True, default=str)
     if page.home_cache is not None and page.home_cache[0] == key:
         return page.home_cache[1]
     try:
-        set_miner_mark(panel_options["miners_mark"])
+        prepare_build(page)
         steps = Node.get_nodes_from_outputs(outputs_from_saved(saved.get("outputs")),
                                             panel_options["recipe_choices"],
                                             panel_options["node_recipe_choices"],
@@ -15215,6 +16017,591 @@ def unloaded_tree(page):
         nodes = None   # a project the data can no longer build still gets its card
     page.home_cache = (key, nodes)
     return nodes
+
+# ---- where an extraction box digs from ----
+#
+# Left of every box digging something up, a source node: a box of its own
+# showing where it digs it from - the resource nodes of the hub the project
+# has for that item. It shows the node's picture, faded and dashed round
+# while the project has none yet; its caret opens the node manager, which
+# picks them and shares the box's need out between them. The machines of
+# the box stand on them (see search.EXTRACTION_SITES). Water a Water
+# Extractor pumps comes from the free water, and its box has nothing to pick.
+# a source box: its picture filling the square of two grid squares on its
+# left, its caret the one square at its top right - in from their edges by
+# this much
+SOURCE_INSET = NODE_INFO_BUTTON_MARGIN
+SOURCE_GAP = GRID_SQUARE * 3            # from its right side to the box it feeds
+
+def source_width():
+    return NODE_HEIGHT + GRID_SQUARE
+
+# where a source node stands for an extraction box standing at `spot`
+def source_spot(spot):
+    return (spot[0] - SOURCE_GAP - source_width(), spot[1])
+
+# Which extraction boxes get a source box: one digging up a resource the
+# hub has nodes of - or water from Water Extractors, which comes free
+def wants_source(node):
+    if not is_extraction(node) or node.needed_item not in RESOURCES["types"]:
+        return False
+    return node_extractor(node.machine) or node.needed_item is FREE_WATER.item
+
+def is_free_source(node):
+    return not node_extractor(node.extraction.machine)
+
+# A step as the map draws it: every extraction box with its source node,
+# linked to it the way a supplier is. The source is kept on its extraction,
+# so the map drawn again finds the same one - and is bolted to it: three
+# squares to its left, level with it, wherever it stands.
+def with_sources(frame, view):
+    if getattr(view, "project_page", None) is None:
+        return frame
+    nodes, links, values = list(frame["nodes"]), list(frame["links"]), dict(frame["values"])
+    for node in frame["nodes"]:
+        if not wants_source(node):
+            continue
+        source = getattr(node, "source_node", None)
+        if source is None:
+            source = node.source_node = search.Source_Node(node)
+        else:
+            source.recalculate()
+        source.coordinate = source_spot(node.coordinate)
+        source.layer = node.layer + 1
+        nodes.append(source)
+        links.append((node, source, source.item, source.rate))
+        values[source] = {"machine_nb": 0, "rate": source.rate, "needed_rate": source.rate}
+    return dict(frame, nodes=nodes, links=links, values=values)
+
+# What a source box shows inside its border: its node's picture and
+# nothing else, filling the square on its left - faded while the project
+# has no node for it yet. Drawn over the box's ground, taking no clicks.
+class SourceContent(QGraphicsItem):
+    def __init__(self, box):
+        super().__init__(box)
+        self.box = box
+        self.setAcceptedMouseButtons(Qt.NoButton)
+        side = box.rect().height() - 2 * SOURCE_INSET
+        path = source_picture(box.node.item)
+        drawing = picture_drawing(path)
+        self.picture = (SymbolItem(drawing[0], drawing[1], side, self) if drawing is not None
+                        else PictureItem(path, side, side, self))
+        self.picture.setPos(SOURCE_INSET, SOURCE_INSET)
+        self.picture.setOpacity(1.0 if box.free or box.assigned() else 0.45)
+
+    def boundingRect(self):
+        return QRectF()
+
+    def paint(self, painter, option, widget=None):
+        pass
+
+# A source node's box: a box of the map like any other - picked and
+# hovered the way they are, its line to its extraction one of the map's own,
+# though bolted to that extraction rather than dragged - if narrower, outlined in its resource's color and dashed
+# while the project has no node for it yet. Its caret opens the node
+# manager, in the map's info panel.
+class SourceBox(NodeItem):
+    def __init__(self, node, view, on_click, on_move, on_caret):
+        super().__init__(source_width(), NODE_HEIGHT, node, on_click, on_move)
+        self.view = view
+        self.page = getattr(view, "project_page", None)
+        self.free = is_free_source(node)
+        self.color = QColor(resource_color(node.item))
+        pen = QPen(self.color, NODE_BORDER_WIDTH)
+        if not self.free and not self.assigned():
+            pen.setStyle(Qt.CustomDashLine)
+            pen.setDashPattern([HOME_GHOST_DASH, HOME_GHOST_DASH])
+        self.setPen(pen)
+        self.setBrush(QBrush(NODE_BG))
+        self.texts = []
+        # the whole square at its top right, a caret as big as it
+        self.caret = GRID_SQUARE - 2 * SOURCE_INSET
+        button = NodeInfoButton(self.caret, self.color.name(), lambda: on_caret(node, self), self,
+                                NODE_INFO_CARET_HEIGHT * self.caret / NODE_INFO_BUTTON_SIZE)
+        button.setPos(self.rect().width() - GRID_SQUARE + SOURCE_INSET, SOURCE_INSET)
+        button.setToolTip("Open the node manager: which of the project's nodes this digs from, and how much")
+        self.info_button = button
+        self.texts.append(button)
+        self.texts.append(SourceContent(self))
+        self.setToolTip("Water Extractors draw it anywhere on water: no node, no limit" if self.free
+                        else f"Where its {html.escape(resource_name(node.item))} is dug from")
+
+    # bolted to its extraction: never dragged by itself, whatever the lock says
+    def set_locked(self, locked):
+        self.setFlag(QGraphicsItem.ItemIsMovable, False)
+        self.setCursor(Qt.ArrowCursor)
+
+    def mousePressEvent(self, event):
+        super().mousePressEvent(event)
+        self.setCursor(Qt.ArrowCursor)
+
+    # the hub's nodes of its type the project has - the free water, for water
+    # pumped by Water Extractors
+    def assigned(self):
+        if self.free:
+            return [FREE_WATER]
+        if self.page is None:
+            return []
+        uid = self.page.uid
+        return [other for other in resource_nodes_of(self.node.item)
+                if other is not FREE_WATER and uid in other.links]
+
+
+# The node manager of water pumped by Water Extractors: the one line, the
+# free water, giving all of what the box needs - nothing to pick or share
+def make_free_water_manager(view, marker):
+    item = marker.item
+    total = marker.rate
+    panel = QWidget()
+    panel.setStyleSheet("background: transparent;")
+    layout = QVBoxLayout(panel)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(8)
+
+    def small_title(text):
+        label = info_label(text.upper(), PANEL_TITLE_COLOR, NODE_INFO_SMALL_FONT_SIZE, bold=True)
+        label.setStyleSheet(label.styleSheet() + f" letter-spacing: {PANEL_TITLE_SPACING}px;")
+        return label
+
+    needed_row = QHBoxLayout()
+    needed_row.addWidget(small_title("Needed"), 1)
+    needed_row.addWidget(info_label(rate_text(item, total), TEXT_STRONG, PANEL_FONT_SIZE + 1, bold=True))
+    layout.addLayout(needed_row)
+    columns = QHBoxLayout()
+    columns.setContentsMargins(RECIPE_MANAGER_DOT + 4 + OUTPUT_RECIPE_GAP, 0, 0, 0)
+    columns.addWidget(small_title("Node"), 1)
+    columns.addWidget(small_title("Rate"))
+    layout.addLayout(columns)
+    row = QHBoxLayout()
+    row.setSpacing(OUTPUT_RECIPE_GAP)
+    row.addWidget(RecipeDot(RECIPE_MANAGER_COLORS[0]))
+    name = info_label("Free water", TEXT_NORMAL, OUTPUT_RECIPE_FONT_SIZE)
+    name.setFixedHeight(OUTPUT_RECIPE_HEIGHT)
+    name.setStyleSheet(name.styleSheet() + f" background: {OUTPUT_FIELD_BG}; border: 1px solid {OUTPUT_FIELD_BORDER};"
+                                           f" border-radius: {HOVER_BORDER_RADIUS}px; padding: 0 6px;")
+    row.addWidget(name, 1)
+    row.addWidget(info_label(rate_text(item, total), TEXT_STRONG, OUTPUT_RECIPE_FONT_SIZE, bold=True))
+    layout.addLayout(row)
+    layout.addWidget(make_panel_divider())
+    bar = RecipeShareBar()
+    bar.set_shares([(RECIPE_MANAGER_COLORS[0], total)], total, True)
+    layout.addWidget(bar)
+    layout.addWidget(info_label("All of it from the free water: Water Extractors, anywhere on water, no limit",
+                                RECIPE_MANAGER_MATCH_COLOR, NODE_INFO_SMALL_FONT_SIZE, wrap=True))
+    for label in panel.findChildren(QLabel):
+        label.setTextInteractionFlags(Qt.NoTextInteraction)
+    return panel
+
+# The node manager, what a source box's info panel holds: what the box
+# takes from each of the project's resource nodes, shared out the way the
+# recipe manager shares an item between recipes. A line a node - picked in
+# its dropdown, its rate typed beside it - a bar of them against what the
+# box needs, and Apply to hand it to the hub. A new node can be added from
+# it too; it is made on the hub as it is applied. What the nodes do not give
+# is left to the planner's own miners.
+def make_source_manager(view, marker):
+    if is_free_source(marker):
+        return make_free_water_manager(view, marker)
+    page = getattr(view, "project_page", None)
+    panel = QWidget()
+    panel.setStyleSheet("background: transparent;")
+    layout = QVBoxLayout(panel)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(8)
+
+    def still(label):
+        label.setTextInteractionFlags(Qt.NoTextInteraction)
+        label.unsetCursor()
+        return label
+
+    def small_title(text):
+        label = info_label(text.upper(), PANEL_TITLE_COLOR, NODE_INFO_SMALL_FONT_SIZE, bold=True)
+        label.setStyleSheet(label.styleSheet() + f" letter-spacing: {PANEL_TITLE_SPACING}px;")
+        return still(label)
+
+    # what the box needs, on a line of its own
+    needed_row = QHBoxLayout()
+    needed_row.addWidget(small_title("Needed"), 1)
+    needed = still(info_label("", TEXT_STRONG, PANEL_FONT_SIZE + 1, bold=True))
+    needed_row.addWidget(needed)
+    layout.addLayout(needed_row)
+
+    columns = QHBoxLayout()
+    columns.setContentsMargins(RECIPE_MANAGER_DOT + 4 + OUTPUT_RECIPE_GAP, 0, 0, 0)
+    columns.setSpacing(OUTPUT_RECIPE_GAP)
+    columns.addWidget(small_title("Node"), 1)
+    rate_title = small_title("Rate")
+    rate_title.setFixedWidth(RECIPE_MANAGER_RATE_WIDTH - 20)
+    rate_title.setAlignment(Qt.AlignRight)
+    columns.addWidget(rate_title)
+    columns.addSpacing(REMOVE_RECIPE_BUTTON_WIDTH + REMOVE_RECIPE_INSET)
+    layout.addLayout(columns)
+
+    lines_holder = QWidget()
+    lines_layout = QVBoxLayout(lines_holder)
+    lines_layout.setContentsMargins(0, 0, 0, 0)
+    lines_layout.setSpacing(6)
+    layout.addWidget(lines_holder)
+
+    add_button = QPushButton("+  Add a node")
+    add_button.setCursor(Qt.PointingHandCursor)
+    add_button.setFocusPolicy(Qt.NoFocus)
+    add_button.setStyleSheet(
+        "QPushButton {"
+        "  background-color: transparent;"
+        f"  color: {TEXT_ACCENT};"
+        f"  border: 1px dashed {OUTPUT_FIELD_BORDER};"
+        f"  border-radius: {HOVER_BORDER_RADIUS}px;"
+        f"  font-size: {NODE_INFO_TEXT_FONT_SIZE}px;"
+        "  font-weight: bold;"
+        "  padding: 7px;"
+        "}"
+        f"QPushButton:hover {{ background-color: {TAB_SYMBOL_HOVER_BG}; color: {TAB_SELECTED_COLOR};"
+        f" border: 1px dashed {TAB_INDICATOR_COLOR}; }}"
+        f"QPushButton:pressed {{ background-color: {TAB_SYMBOL_PRESS_BG}; }}"
+    )
+    layout.addWidget(add_button)
+    layout.addWidget(make_panel_divider())
+
+    bar = RecipeShareBar()
+    layout.addWidget(bar)
+    given_label = still(info_label("", TEXT_MUTED, NODE_INFO_TEXT_FONT_SIZE))
+    hint_label = still(info_label("", TEXT_MUTED, NODE_INFO_SMALL_FONT_SIZE, wrap=True))
+    layout.addWidget(given_label)
+    layout.addWidget(hint_label)
+
+    buttons = QHBoxLayout()
+    buttons.setSpacing(8)
+    reset_button = QPushButton("Reset")
+    apply_button = QPushButton("Apply")
+    for button in (reset_button, apply_button):
+        button.setCursor(Qt.PointingHandCursor)
+        button.setFocusPolicy(Qt.NoFocus)
+        button.setFixedHeight(RECIPE_MANAGER_BUTTON_HEIGHT)
+        button.setIconSize(QSize(CONFIRM_ICON_SIZE, CONFIRM_ICON_SIZE))
+    reset_button.setStyleSheet(
+        "QPushButton {"
+        "  background-color: transparent;"
+        f"  color: {TEXT_MUTED};"
+        f"  border: 1px solid {OUTPUT_FIELD_BORDER};"
+        f"  border-radius: {HOVER_BORDER_RADIUS}px;"
+        f"  font-size: {NODE_INFO_TEXT_FONT_SIZE}px;"
+        "  padding: 0 14px;"
+        "}"
+        f"QPushButton:hover {{ color: {TEXT_STRONG}; border-color: {TAB_SYMBOL_COLOR}; }}"
+        f"QPushButton:pressed {{ background-color: {TAB_SYMBOL_PRESS_BG}; }}"
+        f"QPushButton:disabled {{ color: {TEXT_FAINT}; border-color: {PANEL_DIVIDER_COLOR}; }}"
+    )
+    apply_button.setStyleSheet(
+        "QPushButton {"
+        f"  background-color: {TAB_INDICATOR_COLOR};"
+        f"  color: {TEXT_ON_ACCENT};"
+        f"  border: 1px solid {TAB_INDICATOR_COLOR};"
+        f"  border-radius: {HOVER_BORDER_RADIUS}px;"
+        f"  font-size: {NODE_INFO_TEXT_FONT_SIZE + 1}px;"
+        "  font-weight: bold;"
+        "  padding: 0 14px;"
+        "}"
+        f"QPushButton:hover {{ background-color: {CONFIRM_HOVER_BG}; border-color: {CONFIRM_HOVER_BG}; }}"
+        f"QPushButton:pressed {{ background-color: {ACCENT_PRESS_BG}; border-color: {ACCENT_PRESS_BG}; }}"
+        "QPushButton:disabled {"
+        "  background-color: transparent;"
+        f"  color: {TEXT_DISABLED};"
+        f"  border: 1px solid {PANEL_DIVIDER_COLOR};"
+        "}"
+    )
+    buttons.addWidget(reset_button)
+    buttons.addWidget(apply_button, 1)
+    layout.addLayout(buttons)
+
+    # the draft: [{"node": ResourceNode, or None for a new one, "purity" of
+    # a new one, "rate", "field"}]
+    item = marker.item
+    state = {"applied": [], "total": 0.0, "draft": []}
+
+    def shown(rate):
+        return f"{rate:,.{OUTPUT_RATE_MAX_DECIMALS}f}".rstrip("0").rstrip(".")
+
+    def typed_text(rate):
+        return f"{rate:.{OUTPUT_RATE_MAX_DECIMALS}f}".rstrip("0").rstrip(".")
+
+    def tolerance():
+        return max(10 ** -OUTPUT_RATE_MAX_DECIMALS * 0.6, state["total"] * 1e-9)
+
+    def given():
+        return sum(line["rate"] for line in state["draft"])
+
+    def color_of(index):
+        return RECIPE_MANAGER_COLORS[index % len(RECIPE_MANAGER_COLORS)]
+
+    # every node of the type, numbered as the hub numbers them
+    def numbered():
+        return [(number, node) for number, node in enumerate(resource_nodes_of(item), 1)
+                if node is not FREE_WATER]
+
+    def capacity_of(line):
+        if line["node"] is not None:
+            return line["node"].capacity()
+        return extraction_rate(item, default_extractor(item)) * RESOURCE_PURITY_SHARE[line["purity"]]
+
+    # its number alone, for its dropdown - the rest in its tooltip, and in
+    # the list a node is added from
+    def label_of(line, full=False):
+        if line["node"] is None:
+            if not full:
+                return "New node"
+            return f"New {line['purity'].capitalize()} node \u00b7 {rate_text(item, capacity_of(line))}"
+        number = next(number for number, node in numbered() if node is line["node"])
+        if not full:
+            return f"#{number}"
+        node = line["node"]
+        return (f"#{number} {node.purity.capitalize()} \u00b7 {node.extractor.display_name} "
+                f"\u00b7 {rate_text(item, capacity_of(line))}")
+
+    def over(line):
+        return line["rate"] > capacity_of(line) + tolerance()
+
+    def effective(lines):
+        return sorted((id(node) if node is not None else f"new-{purity}-{index}", round(rate, OUTPUT_RATE_MAX_DECIMALS))
+                      for index, (node, purity, rate) in enumerate(lines) if rate > tolerance())
+
+    def changed():
+        draft = [(line["node"], line.get("purity"), line["rate"]) for line in state["draft"]]
+        return effective(draft) != effective([(node, None, rate) for node, rate in state["applied"]])
+
+    def show_status():
+        total, taken = state["total"], given()
+        unit = rate_unit(item)
+        met = abs(taken - total) <= tolerance()
+        bar.set_shares([(color_of(index), line["rate"]) for index, line in enumerate(state["draft"])], total, met)
+        given_label.setStyleSheet(f"color: {RECIPE_MANAGER_MATCH_COLOR if met else TEXT_MUTED};"
+                                  f" font-size: {NODE_INFO_TEXT_FONT_SIZE}px; background: transparent;")
+        given_label.setText(f"Taken from the nodes: <b>{shown(taken)}</b> {unit}")
+        too_much = next((line for line in state["draft"] if over(line)), None)
+        if too_much is not None:
+            hint, hint_color = f"A node gives only {shown(capacity_of(too_much))} {unit}", POWER_DRAWN_COLOR
+        elif met:
+            hint, hint_color = "Matches what is needed", RECIPE_MANAGER_MATCH_COLOR
+        elif taken < total:
+            hint, hint_color = f"{shown(total - taken)} {unit} left to the miners", TEXT_FAINT
+        else:
+            hint, hint_color = f"{shown(taken - total)} {unit} too much", POWER_DRAWN_COLOR
+        hint_label.setStyleSheet(f"color: {hint_color}; font-size: {NODE_INFO_SMALL_FONT_SIZE}px;"
+                                 " background: transparent;")
+        hint_label.setText(hint)
+        dirty = changed()
+        ready = dirty and too_much is None and taken <= total + tolerance()
+        apply_button.setEnabled(ready)
+        apply_button.setIcon(symbol_icon(draw_done_tick, TEXT_ON_ACCENT if ready else TEXT_DISABLED))
+        apply_button.setToolTip("Take these rates from these nodes" if ready
+                                else "Nothing changed yet" if not dirty
+                                else "A rate is past what its node gives, or past what is needed")
+        reset_button.setEnabled(dirty)
+        reset_button.setIcon(symbol_icon(draw_build_cancel, TEXT_MUTED if dirty else TEXT_FAINT))
+        for line in state["draft"]:
+            field = line.get("field")
+            if field is not None:
+                field.setProperty("over", over(line))
+                field.style().unpolish(field)
+                field.style().polish(field)
+
+    def unused(keep=None):
+        taken = {id(line["node"]) for line in state["draft"] if line["node"] is not None and line is not keep}
+        return [node for _, node in numbered() if id(node) not in taken]
+
+    def make_line(index, line):
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(OUTPUT_RECIPE_GAP)
+        row_layout.addWidget(RecipeDot(color_of(index)))
+        combo = QComboBox()
+        combo.setFixedHeight(OUTPUT_RECIPE_HEIGHT)
+        combo.setCursor(Qt.PointingHandCursor)
+        combo.setItemDelegate(QStyledItemDelegate(combo))
+        combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        combo.setMinimumContentsLength(6)
+        combo.setStyleSheet(
+            "QComboBox {"
+            f"  background-color: {OUTPUT_FIELD_BG}; color: {TAB_SELECTED_COLOR};"
+            f"  border: 1px solid {OUTPUT_FIELD_BORDER}; border-radius: {HOVER_BORDER_RADIUS}px;"
+            f"  font-size: {OUTPUT_RECIPE_FONT_SIZE}px; padding: 0 6px;"
+            "}"
+            f"QComboBox:hover {{ border: 1px solid {TAB_SYMBOL_COLOR}; }}"
+            "QComboBox::drop-down { width: 14px; border: none; }"
+            "QComboBox QAbstractItemView {"
+            f"  outline: 0; background-color: {MENU_BG}; color: {TEXT_NORMAL};"
+            f"  border: 1px solid {OUTPUT_FIELD_BORDER};"
+            f"  selection-background-color: {SELECTION_BG}; selection-color: {TAB_SELECTED_COLOR};"
+            "}"
+        )
+        choices = [line["node"]] if line["node"] is not None else []
+        choices += [node for node in unused(keep=line) if node is not line["node"]]
+        if line["node"] is None:
+            combo.addItem(label_of(line), None)
+            combo.setItemData(0, label_of(line, full=True), Qt.ToolTipRole)
+        for node in choices:
+            combo.addItem(label_of({"node": node}), node)
+            combo.setItemData(combo.count() - 1, label_of({"node": node}, full=True), Qt.ToolTipRole)
+        combo.view().setMinimumWidth(220)
+        combo.setCurrentIndex(0)
+
+        def picked(at):
+            node = combo.itemData(at)
+            if node is not None and node is not line["node"]:
+                line["node"] = node
+                QTimer.singleShot(0, redraw)
+
+        combo.currentIndexChanged.connect(picked)
+        row_layout.addWidget(combo, 1)
+        rate = QLineEdit(typed_text(line["rate"]))
+        rate.setFixedSize(RECIPE_MANAGER_RATE_WIDTH - 20, OUTPUT_RECIPE_HEIGHT)
+        rate.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        rate.setValidator(rate_validator(rate))
+        rate.setToolTip(f"What the box takes of this node, in {rate_unit(item)}\n{RATE_SUM_HINT}")
+        rate.setStyleSheet(
+            "QLineEdit {"
+            f"  background-color: {OUTPUT_FIELD_BG}; color: {TAB_SELECTED_COLOR};"
+            f"  border: 1px solid {OUTPUT_FIELD_BORDER}; border-radius: {HOVER_BORDER_RADIUS}px;"
+            f"  font-size: {OUTPUT_RECIPE_FONT_SIZE}px; padding: 0 6px;"
+            "}"
+            f"QLineEdit:focus {{ background-color: {OUTPUT_FIELD_EDITING_BG}; border: 1px solid {TAB_INDICATOR_COLOR}; }}"
+            f"QLineEdit[over=\"true\"] {{ border: 1px solid {POWER_DRAWN_COLOR}; color: {POWER_DRAWN_COLOR}; }}"
+        )
+
+        def typing(text):
+            value = evaluate_rate(text)
+            if value is None:
+                return
+            line["rate"] = value
+            show_status()
+
+        rate.textEdited.connect(typing)
+        rate.editingFinished.connect(lambda: rate.setText(typed_text(line["rate"])))
+        rate.returnPressed.connect(lambda: apply() if apply_button.isEnabled() else None)
+        line["field"] = rate
+        row_layout.addWidget(rate)
+        remove = make_remove_recipe_button(OUTPUT_RECIPE_HEIGHT)
+        remove.setToolTip("Take this node off the box - its rate is left to the miners")
+        remove.clicked.connect(lambda: remove_line(line))
+        row_layout.addWidget(remove)
+        row_layout.addSpacing(REMOVE_RECIPE_INSET - OUTPUT_RECIPE_GAP)
+        return row
+
+    def show_lines():
+        while lines_layout.count():
+            entry = lines_layout.takeAt(0)
+            if entry.widget() is not None:
+                entry.widget().hide()
+                entry.widget().deleteLater()
+        for index, line in enumerate(state["draft"]):
+            row = make_line(index, line)
+            lines_layout.addWidget(row)
+            row.show()
+
+    # the draft changed shape: its lines made again, the panel as tall as them
+    def redraw():
+        show_lines()
+        show_status()
+        resize = getattr(getattr(view, "info_panel", None), "on_resize", None)
+        if resize is not None:
+            resize()
+
+    def remove_line(line):
+        if line in state["draft"]:
+            state["draft"].remove(line)
+            QTimer.singleShot(0, redraw)
+
+    # added for what is still left - as much as it gives, at most
+    def add(node=None, purity="normal"):
+        line = {"node": node, "purity": purity, "rate": 0.0}
+        line["rate"] = min(max(state["total"] - given(), 0.0), capacity_of(line))
+        state["draft"].append(line)
+        redraw()
+        field = line.get("field")
+        if field is not None:
+            field.setFocus()
+            field.selectAll()
+
+    def pick_to_add():
+        menu = QMenu(add_button)
+        menu.setStyleSheet(
+            "QMenu {"
+            f"  background: {MENU_BG}; color: {TEXT_NORMAL};"
+            f"  border: 1px solid {OUTPUT_FIELD_BORDER}; border-radius: {HOVER_BORDER_RADIUS}px;"
+            f"  padding: 4px; font-size: {OUTPUT_RECIPE_FONT_SIZE}px;"
+            "}"
+            "QMenu::item { padding: 7px 22px 7px 14px; border-radius: 3px; }"
+            f"QMenu::item:selected {{ background: {SELECTION_BG}; color: {TAB_SELECTED_COLOR}; }}"
+            f"QMenu::separator {{ height: 1px; background: {OUTPUT_FIELD_BORDER}; margin: 4px 6px; }}"
+        )
+        for node in unused():
+            menu.addAction(label_of({"node": node}, full=True),
+                           lambda node=node: QTimer.singleShot(0, lambda: add(node)))
+        if menu.actions():
+            menu.addSeparator()
+        for purity in RESOURCE_PURITIES:
+            menu.addAction(label_of({"node": None, "purity": purity}, full=True),
+                           lambda purity=purity: QTimer.singleShot(0, lambda: add(None, purity)))
+        menu.setMinimumWidth(add_button.width())
+        menu.exec(add_button.mapToGlobal(QPoint(0, add_button.height() + 2)))
+
+    def reset():
+        state["draft"] = [{"node": node, "purity": node.purity, "rate": rate} for node, rate in state["applied"]]
+        redraw()
+
+    # handed to the hub: the nodes of the draft linked at their rates - a new
+    # one made there first - and every other node of the type let go of. The
+    # map is drawn again, this panel with it.
+    def apply():
+        if not apply_button.isEnabled() or page is None:
+            return
+        uid = page.uid
+        kept = set()
+        for line in state["draft"]:
+            node = line["node"]
+            if line["rate"] <= tolerance():
+                continue
+            if node is None:
+                node = ResourceNode(item, line["purity"])
+                RESOURCES["nodes"].append(node)
+            node.links.add(uid)
+            node.rates[uid] = line["rate"]
+            kept.add(id(node))
+        for _, node in numbered():
+            if id(node) not in kept:
+                node.links.discard(uid)
+                node.rates.pop(uid, None)
+        home = getattr(getattr(view.window(), "project_tabs", None), "home_page", None)
+
+        def done():
+            if home is not None:
+                home.resources_changed()
+            else:
+                schedule_save()
+                changed_sites = getattr(view, "on_sites_changed", None)
+                if changed_sites is not None:
+                    changed_sites()
+
+        QTimer.singleShot(0, done)
+
+    add_button.clicked.connect(pick_to_add)
+    reset_button.clicked.connect(reset)
+    apply_button.clicked.connect(apply)
+
+    # what the boxes digging it up need, off the tree as it stands
+    steps = getattr(view, "build_steps", None) or []
+    boxes = [node for node in (steps[-1]["nodes"] if steps else []) if is_extraction(node)
+             and node.needed_item is item and node_extractor(node.machine)]
+    state["total"] = sum(entry["rate"] for node in boxes for entry in node.products if entry["item"] is item)
+    uid = page.uid if page is not None else None
+    state["applied"] = [(node, node.wanted(uid)) for _, node in numbered() if uid in node.links]
+    needed.setText(rate_text(item, state["total"]))
+    state["draft"] = [{"node": node, "purity": node.purity, "rate": rate} for node, rate in state["applied"]]
+    show_lines()
+    show_status()
+    return panel
+
 
 # ---- the grid and what draws on it from outside the tree ----
 #
@@ -15319,6 +16706,261 @@ def default_pump():
 def pumps_from_saved(saved):
     return {tuple(key): [list(pump) for pump in placed] for key, placed in (saved or [])}
 
+# ---- resource nodes ----
+#
+# The nodes of the world the factory draws its ore, oil and gas from. Each
+# kind of resource the player mines is a type on the hub (Iron Ore, Coal...),
+# and every node of it they tap is one ResourceNode under that type - its
+# purity, and the extractor standing on it, saying how much it can give. What
+# the projects extract of a type is poured into its nodes in order, each
+# filled before the next is used, which is what says how much of each node is
+# used and which projects it feeds. (Each project's own graph is to pick its
+# nodes itself later on.)
+RESOURCE_PURITIES = ("impure", "normal", "pure")
+RESOURCE_PURITY_SHARE = {"impure": 0.5, "normal": 1.0, "pure": 2.0}
+RESOURCE_PURITY_COLORS = {"impure": "#e0796c", "normal": "#e8c15a", "pure": "#6fcf8e"}
+
+# the extractors that stand on a node, rather than anywhere (a water pump)
+def node_extractor(machine):
+    name = machine.full_name
+    return name.startswith("Build_MinerMk") or name in ("Build_OilPump_C", "Build_FrackingExtractor_C")
+
+# the extraction recipe `item` is run with on `machine`, or None
+def extraction_recipe(item, machine):
+    return next((recipe for recipe in item.recipes
+                 if not recipe.ingredients and machine in recipe.machine), None)
+
+# every extractor a node of `item` can carry, in the data's order - none for
+# an item no node gives
+def resource_extractors(item):
+    return [machine for recipe in item.recipes if not recipe.ingredients
+            for machine in recipe.machine if node_extractor(machine)]
+
+# what can be a type on the hub: every item some node gives
+def resource_items():
+    return [item for item in All_Items.values() if resource_extractors(item)]
+
+# Every type, in the order the game has the player first need it - the tier
+# (or the MAM research) that unlocks the first recipe taking it - and the
+# color it wears on the hub, close to the resource's own in the game while
+# still telling it apart from its neighbours on the dark grid.
+RESOURCE_KINDS = [
+    ("Desc_OreIron_C", "#c08a74"),       # iron ingots, from the start
+    ("Desc_OreCopper_C", "#e5873a"),     # copper, from the start
+    ("Desc_Stone_C", "#d8cda6"),         # concrete, from the start
+    ("Desc_Coal_C", "#000000"),          # steel and coal power, tier 3
+    ("Desc_Water_C", "#4aa8e8"),         # coal generators, tier 3
+    ("Desc_OreGold_C", "#f2c443"),       # caterium, MAM
+    ("Desc_RawQuartz_C", "#ea8fc9"),     # quartz, MAM
+    ("Desc_Sulfur_C", "#d4e04c"),        # black powder, MAM
+    ("Desc_LiquidOil_C", "#7a6fb8"),     # oil processing, tier 5
+    ("Desc_OreBauxite_C", "#c9483a"),    # aluminum, tier 7
+    ("Desc_NitrogenGas_C", "#a6e6f0"),   # nitrogen, tier 8
+    ("Desc_OreUranium_C", "#6fe05a"),    # nuclear power, tier 8
+    ("Desc_SAM_C", "#b65ee8"),           # SAM, tier 9
+]
+RESOURCE_KIND_COLORS = dict(RESOURCE_KINDS)
+
+# where an item stands in that order - any the list does not know after the rest
+def resource_rank(item):
+    known = [name for name, _ in RESOURCE_KINDS]
+    return known.index(item.full_name) if item.full_name in known else len(known)
+
+# the types as the hub shows them: every one, in that order - any the list
+# does not know of yet after the rest
+def resource_order():
+    known = {name: index for index, (name, _) in enumerate(RESOURCE_KINDS)}
+    return sorted(resource_items(), key=lambda item: known.get(item.full_name, len(known)))
+
+# a new node's extractor: the miner of the planner's mark, for an ore
+def default_extractor(item):
+    choices = resource_extractors(item)
+    miner = search.MINER_NAME.format(panel_options["miners_mark"])
+    return next((machine for machine in choices if machine.full_name == miner), choices[0])
+
+# one machine at full clock on a normal node, a minute
+def extraction_rate(item, machine):
+    recipe = extraction_recipe(item, machine)
+    if recipe is None:
+        return 0.0
+    duration = (getattr(recipe, "miner_durations", None) or {}).get(machine, recipe.duration)
+    amount = next((entry["amount"] for entry in recipe.products if entry["item"] is item), 0)
+    return amount * 60 / duration if duration else 0.0
+
+# A power shard in the extractor on a node: each one clocks it 50% faster,
+# three at most - 250%
+RESOURCE_SHARD_STEP = 0.5
+RESOURCE_SHARDS_MAX = 3
+
+def shard_clock(shards):
+    return 1.0 + RESOURCE_SHARD_STEP * shards
+
+class ResourceNode:
+    def __init__(self, item, purity="normal", extractor=None, links=(), shards=0, rates=None):
+        self.item = item
+        self.shards = max(0, min(int(shards or 0), RESOURCE_SHARDS_MAX))   # its overclock
+        # the projects it feeds, by their uid: none until the player links it
+        # to one - a node is never handed to a project on its own
+        self.links = set(links)
+        # how much of it a project takes, by uid, as its node manager shares
+        # it out - one with none set takes all it can give
+        self.rates = {uid: float(rate) for uid, rate in (rates or {}).items() if uid in self.links}
+        self.purity = purity if purity in RESOURCE_PURITIES else "normal"
+        self.extractor = extractor if extractor in resource_extractors(item) else default_extractor(item)
+
+    # what it gives at full clock, before its shards - and with them
+    def base_capacity(self):
+        return extraction_rate(self.item, self.extractor) * RESOURCE_PURITY_SHARE[self.purity]
+
+    def capacity(self):
+        return self.base_capacity() * shard_clock(self.shards)
+
+    # what project `uid` takes of it at most: its share, never past what it gives
+    def wanted(self, uid):
+        return min(self.rates.get(uid, float("inf")), self.capacity())
+
+# The water type's own instance, always there and first among its nodes: the
+# free water Water Extractors draw anywhere on water, standing on no node.
+# Every project's pumped water comes from it without a link, as much as it
+# asks for - there is no limit to it. Never saved: made again on every load.
+WATER_NAME = "Desc_Water_C"
+
+class FreeWater:
+    def __init__(self):
+        self.links = set()   # never linked by hand: it feeds whoever pumps water
+
+    @property
+    def item(self):
+        return All_Items.get(WATER_NAME)
+
+    def capacity(self):
+        return 0.0   # what it gives is what is asked of it (see allocate_resources)
+
+FREE_WATER = FreeWater()
+
+# the types on the hub, in their order (see resource_order); every node; the
+# types shown opened up
+RESOURCES = {"types": [], "nodes": [], "expanded": set()}
+
+def resource_nodes_of(item):
+    nodes = [node for node in RESOURCES["nodes"] if node.item is item]
+    return [FREE_WATER] + nodes if item is FREE_WATER.item else nodes
+
+def saved_resources():
+    return {"nodes": [{"item": node.item.full_name, "purity": node.purity,
+                       "extractor": node.extractor.full_name, "links": sorted(node.links),
+                       "shards": node.shards, "rates": dict(node.rates)}
+                      for node in RESOURCES["nodes"]],
+            "expanded": [item.full_name for item in RESOURCES["types"] if item in RESOURCES["expanded"]]}
+
+# read back - leaving out what the data no longer has
+def load_resources(saved):
+    saved = saved or {}
+    RESOURCES["types"] = resource_order()   # every type is always there
+    RESOURCES["nodes"] = [ResourceNode(All_Items[node["item"]], node.get("purity", "normal"),
+                                       All_Machines.get(node.get("extractor")), node.get("links", ()),
+                                       node.get("shards", 0), node.get("rates"))
+                          for node in saved.get("nodes", [])
+                          if All_Items.get(node.get("item")) in RESOURCES["types"]]
+    RESOURCES["expanded"] = {All_Items[name] for name in saved.get("expanded", [])
+                             if All_Items.get(name) in RESOURCES["types"]}
+
+# What a project's tree takes out of the ground, by item: what its extraction
+# boxes run on a node's extractor make - not what a water pump draws, which
+# stands on no node
+# `on_nodes` off counts every extractor - a water pump's water too - and
+# what is brought in by hand (a Manual_Node): all a project takes in, as its
+# card shows it
+def extraction_of(nodes, on_nodes=True):
+    taken = {}
+    for node in nodes or ():
+        if not on_nodes and isinstance(node, Manual_Node) and node.merged_into is None:
+            if node.rate > 0:
+                taken[node.item] = taken.get(node.item, 0.0) + node.rate
+            continue
+        if (isinstance(node, Recipe_Node) and node.merged_into is None and not node.recipe.ingredients
+                and node.needed_item is not POWER_ITEM and (node_extractor(node.machine) or not on_nodes)):
+            rate = sum(entry["rate"] for entry in node.products if entry["item"] is node.needed_item)
+            if rate > 0:
+                taken[node.needed_item] = taken.get(node.needed_item, 0.0) + rate
+    return taken
+
+# the water a project's Water Extractors draw: off any node, free (see FreeWater)
+def pumped_water(nodes):
+    return sum(entry["rate"] for node in nodes or ()
+               if isinstance(node, Recipe_Node) and node.merged_into is None and not node.recipe.ingredients
+               and node.needed_item is FREE_WATER.item and not node_extractor(node.machine)
+               for entry in node.products if entry["item"] is node.needed_item and entry["rate"] > 0)
+
+# What each type gives each project, through the links the player made: a
+# project's demand poured into the nodes linked to it alone, in their order,
+# each filled before the next - and a node feeding several projects shared
+# out among them in the hub's order. A project no node of a type is linked
+# to gets none of it, and no line from it. Pumped water comes from the free
+# water alone, every bit of it, and counts as given as much as asked.
+# {item: {"demand", "capacity", "supplied", "short",
+#         "projects": {page: rate}, "nodes": {node: {page: rate}}}}
+# where "projects" and every node's share hold each project linked, fed or
+# not. `demands` is [(page, {item: rate}, pumped water)].
+def allocate_resources(demands):
+    result = {}
+    for item in RESOURCES["types"]:
+        nodes = resource_nodes_of(item)
+        room = [node.capacity() for node in nodes]
+        share = {node: {} for node in nodes}
+        projects, demand, free = {}, 0.0, 0.0
+        for page, taken, pumped in demands:
+            if item is FREE_WATER.item and pumped > 0:
+                share[FREE_WATER][page] = pumped
+                projects[page] = projects.get(page, 0.0) + pumped
+                demand += pumped
+                free += pumped
+            rate = taken.get(item, 0.0)
+            demand += max(rate, 0.0)
+            linked = [index for index, node in enumerate(nodes) if page.uid in node.links]
+            if not linked:
+                continue
+            left = max(rate, 0.0)
+            for index in linked:
+                poured = min(left, room[index], nodes[index].rates.get(page.uid, float("inf")))
+                share[nodes[index]][page] = share[nodes[index]].get(page, 0.0) + poured
+                room[index] -= poured
+                left -= poured
+            projects[page] = projects.get(page, 0.0) + max(rate, 0.0) - left
+        capacity = sum(node.capacity() for node in nodes) + free
+        supplied = sum(projects.values())
+        result[item] = {"demand": demand, "capacity": capacity, "supplied": supplied,
+                        "short": max(demand - capacity, 0.0), "projects": projects, "nodes": share}
+    return result
+
+# a type's color on the hub: its line and its outline - one the list has no
+# color for yet takes one of the recipe manager's
+def resource_color(item):
+    color = RESOURCE_KIND_COLORS.get(item.full_name)
+    if color is not None:
+        return color
+    index = RESOURCES["types"].index(item) if item in RESOURCES["types"] else 0
+    return RECIPE_MANAGER_COLORS[index % len(RECIPE_MANAGER_COLORS)]
+
+# A resource as the hub's section names it: what is dug out of a node is
+# taken for ore there, so "Caterium Ore" is just Caterium
+def resource_name(item):
+    name = item.display_name
+    return name[:-len(" Ore")] if name.endswith(" Ore") else name
+
+# the node's own picture, once there is one in Images - the item's until then
+def resource_node_picture(item):
+    path = resource_node_path(item)
+    return path if picture_exists(path) else item_picture(item)
+
+def resource_node_path(item):
+    return f"img/ResourceNode_{item.full_name}.png"
+
+# a source node's picture: the node itself, never what it gives - the drawn
+# frame of a missing picture until the image folder has it
+def source_picture(item):
+    return picture_or_missing(resource_node_path(item))
+
 # what a card says about its project: what it asks for, whether it has been
 # built, and - if it has - its buildings, its power and how much of it is up
 def project_summary(page):
@@ -15342,7 +16984,12 @@ def project_summary(page):
         done = set(saved.get("built_nodes") or ())
     summary = {"outputs": [(item, rate) for item, rate in outputs if isinstance(item, search.Item)],
                "built": nodes is not None,
-               "buildings": 0, "made": 0.0, "drawn": 0.0, "done": 0, "total": 0}
+               "buildings": 0, "made": 0.0, "drawn": 0.0, "done": 0, "total": 0,
+               "extracted": extraction_of(nodes),   # what it takes out of the ground, off nodes
+               "pumped": pumped_water(nodes),       # ...and the free water its pumps draw
+               # ...and all of it, a water pump's included, in the order of the game
+               "inputs": sorted(extraction_of(nodes, on_nodes=False).items(),
+                                key=lambda taken: resource_rank(taken[0]))}
     if nodes:
         power = next((node for node in nodes if is_power_node(node)), None)
         if power is not None:
@@ -15424,33 +17071,79 @@ class CardMenuButton(QGraphicsItem):
 
 
 # The power switch beside the "...": a project switched off stays on the hub,
-# faded, but its power is out of the hub's count and its line comes down. It
-# keeps its own strength whatever the card it sits on is faded to, so it can
-# still be read and switched back on.
+# faded, but its power is out of the hub's count and its line comes down. A
+# switch, the way a setting's is: light grey with its knob to the right while
+# the project is on the grid, dark with its knob to the left while it is not.
+# It fades with the card it sits on, off with the rest of the project. `knob`
+# runs from 0, off, to 1, on -
+# the hub slides it over as it is flipped (see HomePage.switch_project).
 class CardSwitchButton(CardMenuButton):
     def __init__(self, color, on_click, off, parent=None):
         super().__init__(color, on_click, parent)
-        self.setFlag(QGraphicsItem.ItemIgnoresParentOpacity)
+        self.knob = 0.0 if off else 1.0
         self.setToolTip("Switch this project back on, on the hub" if off
                         else "Switch this project off on the hub: its power is left out")
 
     def paint_mark(self, painter):
         size = self.box.width()
-        painter.setPen(QPen(self.color, size / 12, Qt.SolidLine, Qt.RoundCap))
+        track = QRectF(0, 0, size * 0.8, size * 0.44)
+        track.moveCenter(self.box.center())
+        radius = track.height() / 2
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(HOME_SWITCH_OFF_TRACK)
+        painter.drawRoundedRect(track, radius, radius)
+        lit = QColor(HOME_SWITCH_ON_TRACK)
+        lit.setAlphaF(self.knob)
+        painter.setBrush(lit)
+        painter.drawRoundedRect(track, radius, radius)
+        # the track's own outline, in the band's text color: it reads on any band
+        edge = QColor(self.color)
+        edge.setAlpha(110)
+        painter.setPen(QPen(edge, size / 40))
         painter.setBrush(Qt.NoBrush)
-        ring = QRectF(0, 0, size * 0.42, size * 0.42)
-        ring.moveCenter(self.box.center() + QPointF(0, size * 0.03))
-        # the ring open at the top, and the stroke down into that gap
-        painter.drawArc(ring, 125 * 16, 290 * 16)
-        painter.drawLine(QPointF(ring.center().x(), ring.top() - size * 0.06), ring.center())
+        painter.drawRoundedRect(track, radius, radius)
+        # the knob, with a faint rim: white still reads on the light track
+        painter.setPen(QPen(QColor(0, 0, 0, 60), size / 60))
+        painter.setBrush(QColor(HOME_SWITCH_KNOB))
+        middle = QPointF(track.left() + radius + (track.width() - 2 * radius) * self.knob, track.center().y())
+        painter.drawEllipse(middle, radius * 0.74, radius * 0.74)
+
+
+# A project's box to tick it complete from the hub, before what its bar
+# says: every box of it ticked off as built at once, or none of them - the
+# same as the Complete button on its own map. Ticked while it is complete.
+class CardCompleteButton(CardMenuButton):
+    def __init__(self, complete, on_click, parent=None):
+        super().__init__(TEXT_MUTED, on_click, parent)
+        self.prepareGeometryChange()
+        self.box = QRectF(0, 0, HOME_CARD_COMPLETE_BOX, HOME_CARD_COMPLETE_BOX)
+        self.complete = complete
+        self.setToolTip("Take every tick off this project" if complete
+                        else "Mark the whole project as built")
+
+    def paint_mark(self, painter):
+        size = self.box.width()
+        square = self.box.adjusted(size * 0.18, size * 0.18, -size * 0.18, -size * 0.18)
+        color = QColor(HOME_CARD_COMPLETE_COLOR if self.complete else TEXT_MUTED)
+        if self.hovered:
+            color = QColor(TEXT_STRONG)
+        painter.setPen(QPen(color, size / 14))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(square, size / 8, size / 8)
+        if self.complete:
+            tick = QPainterPath(QPointF(square.left() + square.width() * 0.22, square.center().y()))
+            tick.lineTo(square.left() + square.width() * 0.43, square.bottom() - square.height() * 0.24)
+            tick.lineTo(square.right() - square.width() * 0.2, square.top() + square.height() * 0.26)
+            painter.setPen(QPen(color, size / 11, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.drawPath(tick)
 
 
 # What every card on the hub shares: a box of whole grid squares that lifts
 # under the mouse, opens something on a click, and - where it can be moved -
 # is dragged about, snapping to the grid on the way when the hub says so.
 class HomeCardItem(QGraphicsRectItem):
-    def __init__(self, on_click, width=HOME_CARD_WIDTH):
-        super().__init__(0, 0, width, HOME_CARD_HEIGHT)
+    def __init__(self, on_click, width=HOME_CARD_WIDTH, height=HOME_CARD_HEIGHT):
+        super().__init__(0, 0, width, height)
         self.on_click = on_click
         # (card, scene point, "start" / "move" / "drop") while it is dragged
         # to another place in the order; None for a card that cannot be
@@ -15589,13 +17282,18 @@ class HomeCardItem(QGraphicsRectItem):
 # One project on the hub. Its band and outline are the project's tab color,
 # so a project reads as the same thing on its tab and on the hub.
 class ProjectCardItem(HomeCardItem):
-    def __init__(self, page, summary, on_click, on_menu, on_switch, last=False):
+    def __init__(self, page, summary, on_click, on_menu, on_switch, last=False, on_complete=None):
         # its outputs' pictures along the middle, what each is asked for
         # under it: as wide as they need, up to HOME_CARD_PICTURES of them
+        # and under them a second row, what it takes in - its raw resources
         outputs = summary["outputs"]
+        inputs = summary.get("inputs", [])
         shown = outputs if len(outputs) <= HOME_CARD_PICTURES else outputs[:HOME_CARD_PICTURES - 1]
         more = len(outputs) - len(shown)
-        super().__init__(on_click, home_card_width(len(shown) + (1 if more else 0)))
+        taken = inputs if len(inputs) <= HOME_CARD_PICTURES else inputs[:HOME_CARD_PICTURES - 1]
+        more_taken = len(inputs) - len(taken)
+        across = max(len(shown) + (1 if more else 0), len(taken) + (1 if more_taken else 0))
+        super().__init__(on_click, home_card_width(across), HOME_PROJECT_HEIGHT)
         self.on_menu = on_menu     # called with the screen point its menu opens at
         self.page = page
         self.summary = summary
@@ -15615,28 +17313,84 @@ class ProjectCardItem(HomeCardItem):
         self.switch_button.setPos(self.menu_button.pos() - QPointF(HOME_MENU_BUTTON, 0))
         if self.off:
             self.setOpacity(HOME_CARD_OFF_OPACITY)
+        # the box ticking it complete, just before what its bar says - once
+        # it has boxes to tick
+        self.complete_button = None
+        if on_complete is not None and summary["built"] and summary["total"]:
+            whole = summary["done"] >= summary["total"]
+            # the words get the same room whatever they say, so the box and
+            # the bar before it never move or change length as they do
+            right = self.rect().width() - HOME_CARD_PAD - HOME_CARD_BUILT_TEXT_WIDTH
+            self.complete_button = CardCompleteButton(whole, on_complete, self)
+            self.complete_button.setPos(right - HOME_CARD_COMPLETE_GAP - HOME_CARD_COMPLETE_BOX,
+                                        HOME_CARD_BAR_TOP + HOME_CARD_INPUT_ROW + HOME_CARD_BAR_HEIGHT / 2
+                                        - HOME_CARD_COMPLETE_BOX / 2)
+
+        # an arrow along its bottom for every resource it takes from the
+        # nodes, in the type's color, whether or not a node is linked to it
+        # yet - the way a recipe's box shows every ingredient's port: the
+        # lines from the nodes come up into them (see HomePage.route_resources)
+        self.input_ports = {}
+        needs = dict(summary.get("extracted", {}))
+        if summary.get("pumped", 0) > 0 and FREE_WATER.item is not None:
+            needs[FREE_WATER.item] = needs.get(FREE_WATER.item, 0.0) + summary["pumped"]
+        taking = sorted((item for item in needs if item in RESOURCES["types"]), key=resource_rank)
+        width, height = self.rect().width(), self.rect().height()
+        first = NODE_RADIUS
+        for index, item in enumerate(taking):
+            x = first + (width - 2 * first) * (index + 0.5) / len(taking)
+            self.input_ports[item] = x
+            arrow = QGraphicsPolygonItem(border_arrow_points(x, height, True), self)
+            arrow.setPen(QPen(Qt.NoPen))
+            arrow.setBrush(QColor(resource_color(item)))
+            arrow.setAcceptedMouseButtons(Qt.NoButton)
+            arrow.setToolTip(f"{html.escape(resource_name(item))}: "
+                             f"{rate_text(item, needs[item])} needed")
 
         self.more = more
-        self.rates = []
+        self.more_taken = more_taken
         self.pictures = []
-        for index, (item, rate) in enumerate(shown):
-            x = HOME_CARD_PAD + index * (HOME_CARD_PICTURE + HOME_CARD_PICTURE_GAP)
+        self.rates = self.picture_row(shown, HOME_CARD_PICTURE_TOP)
+        self.input_rates = self.picture_row(taken, HOME_CARD_PICTURE_TOP + HOME_CARD_INPUT_ROW)
+
+        lines = [f"<b>{html.escape(self.name)}</b>"]
+        lines += [f"{html.escape(item.display_name)}: {rate_text(item, rate)}" for item, rate in outputs]
+        if inputs:
+            lines.append("<i>Takes in</i>")
+            lines += [f"{html.escape(item.display_name)}: {rate_text(item, rate)}" for item, rate in inputs]
+        if self.off:
+            lines.append("<i>Switched off: left out of the hub's power</i>")
+        lines.append("<i>Click to open - right click for more</i>")
+        self.setToolTip("<br>".join(lines))
+
+    # where the line bringing `item` in meets its bottom, on the map: its
+    # arrow's, or the middle of its bottom for one it has no arrow for
+    def input_port(self, item):
+        x = self.input_ports.get(item, self.rect().width() / 2)
+        return self.mapToScene(QPointF(x, self.rect().height()))
+
+    # what its bar says: how much of it is built, or that all of it is
+    def bar_words(self):
+        summary = self.summary
+        if summary["total"] and summary["done"] >= summary["total"]:
+            return "Completed"
+        return f"{summary['done']}/{summary['total']} built"
+
+    # one row of pictures at `top`, each item's: [(x, its rate written)]
+    def picture_row(self, entries, top):
+        rates = []
+        for index, (item, rate) in enumerate(entries):
+            x = HOME_CARD_PAD + HOME_CARD_ROW_LABEL + index * (HOME_CARD_PICTURE + HOME_CARD_PICTURE_GAP)
             path = item_picture(item)
             drawing = picture_drawing(path)
             if drawing is not None:
                 picture = SymbolItem(drawing[0], drawing[1], HOME_CARD_PICTURE, self)
             else:
                 picture = PictureItem(path, HOME_CARD_PICTURE, HOME_CARD_PICTURE, self)
-            picture.setPos(x, HOME_CARD_PICTURE_TOP)
+            picture.setPos(x, top)
             self.pictures.append(picture)
-            self.rates.append((x, rate_text(item, rate)))
-
-        lines = [f"<b>{html.escape(self.name)}</b>"]
-        lines += [f"{html.escape(item.display_name)}: {rate_text(item, rate)}" for item, rate in outputs]
-        if self.off:
-            lines.append("<i>Switched off: left out of the hub's power</i>")
-        lines.append("<i>Click to open - right click for more</i>")
-        self.setToolTip("<br>".join(lines))
+            rates.append((x, rate_text(item, rate)))
+        return rates
 
     # the menu drops from under the "..."...
     def menu_from_button(self):
@@ -15683,22 +17437,38 @@ class ProjectCardItem(HomeCardItem):
         summary = self.summary
         if not summary["outputs"]:
             paint_card_text(painter, scale,
-                            QRectF(HOME_CARD_PAD, HOME_CARD_HEADER, inner, HOME_CARD_HEIGHT - HOME_CARD_HEADER),
+                            QRectF(HOME_CARD_PAD, HOME_CARD_HEADER, inner, self.rect().height() - HOME_CARD_HEADER),
                             "Nothing asked for yet", HOME_CARD_TEXT_SIZE, TEXT_MUTED, Qt.AlignCenter)
             return
 
-        rate_top = HOME_CARD_PICTURE_TOP + HOME_CARD_PICTURE + 2
-        for x, text in self.rates:
+        # what it makes, and under it what it takes in - each row said
+        # before its pictures, level with them
+        for word, rates, more, top in (("OUT", self.rates, self.more, HOME_CARD_PICTURE_TOP),
+                                       ("IN", self.input_rates, self.more_taken,
+                                        HOME_CARD_PICTURE_TOP + HOME_CARD_INPUT_ROW)):
+            # against the card's left side, level with the middle of the
+            # row's pictures and rates together
             paint_card_text(painter, scale,
-                            QRectF(x - HOME_CARD_PICTURE_GAP / 2, rate_top,
-                                   HOME_CARD_PICTURE + HOME_CARD_PICTURE_GAP, HOME_CARD_SMALL_SIZE * 1.4),
-                            text, HOME_CARD_SMALL_SIZE, TEXT_NORMAL, Qt.AlignHCenter | Qt.AlignTop)
-        if self.more:
-            x = HOME_CARD_PAD + len(self.rates) * (HOME_CARD_PICTURE + HOME_CARD_PICTURE_GAP)
-            paint_card_text(painter, scale, QRectF(x, HOME_CARD_PICTURE_TOP, HOME_CARD_PICTURE, HOME_CARD_PICTURE),
-                            f"+{self.more}", HOME_CARD_TEXT_SIZE, TEXT_MUTED, Qt.AlignCenter)
+                            QRectF(HOME_CARD_PAD, top, HOME_CARD_ROW_LABEL,
+                                   HOME_CARD_PICTURE + 2 + HOME_CARD_SMALL_SIZE * 1.4),
+                            word, HOME_CARD_ROW_LABEL_SIZE, TEXT_MUTED, Qt.AlignLeft | Qt.AlignVCenter, bold=True)
+            for x, text in rates:
+                paint_card_text(painter, scale,
+                                QRectF(x - HOME_CARD_PICTURE_GAP / 2, top + HOME_CARD_PICTURE + 2,
+                                       HOME_CARD_PICTURE + HOME_CARD_PICTURE_GAP, HOME_CARD_SMALL_SIZE * 1.4),
+                                text, HOME_CARD_SMALL_SIZE, TEXT_NORMAL, Qt.AlignHCenter | Qt.AlignTop)
+            if more:
+                x = HOME_CARD_PAD + HOME_CARD_ROW_LABEL + len(rates) * (HOME_CARD_PICTURE + HOME_CARD_PICTURE_GAP)
+                paint_card_text(painter, scale, QRectF(x, top, HOME_CARD_PICTURE, HOME_CARD_PICTURE),
+                                f"+{more}", HOME_CARD_TEXT_SIZE, TEXT_MUTED, Qt.AlignCenter)
+        # a faint line between the two rows
+        divider = HOME_CARD_PICTURE_TOP + HOME_CARD_INPUT_ROW - HOME_CARD_INPUT_DIVIDER_GAP
+        painter.setPen(screen_pen(painter, QPen(QColor(HOME_CARD_INPUT_DIVIDER), 2), scale))
+        painter.drawLine(QPointF(HOME_CARD_PAD, divider), QPointF(HOME_CARD_PAD + inner, divider))
 
-        row = QRectF(HOME_CARD_PAD, HOME_CARD_STATS_TOP, inner, HOME_CARD_TEXT_SIZE * 1.4)
+        # everything under the pictures sits a row lower, under the second one
+        low = HOME_CARD_INPUT_ROW
+        row = QRectF(HOME_CARD_PAD, HOME_CARD_STATS_TOP + low, inner, HOME_CARD_TEXT_SIZE * 1.4)
         if not summary["built"]:
             paint_card_text(painter, scale, row, "Not built yet", HOME_CARD_TEXT_SIZE, TEXT_MUTED)
             return
@@ -15726,38 +17496,50 @@ class ProjectCardItem(HomeCardItem):
                 for text, color in reversed(parts):
                     width = metrics.horizontalAdvance(text) + 2
                     paint_card_text(painter, scale,
-                                    QRectF(right - width, HOME_CARD_SPLIT_TOP, width, HOME_CARD_SMALL_SIZE * 1.4),
+                                    QRectF(right - width, HOME_CARD_SPLIT_TOP + low, width, HOME_CARD_SMALL_SIZE * 1.4),
                                     text, HOME_CARD_SMALL_SIZE, color, Qt.AlignRight | Qt.AlignVCenter)
                     right -= width + HOME_CARD_POWER_GAP
 
         # how much of it stands in the world: the boxes ticked off as built
         if summary["total"]:
             share = summary["done"] / summary["total"]
-            bar = QRectF(HOME_CARD_PAD, HOME_CARD_BAR_TOP,
-                         inner - HOME_CARD_BAR_TEXT_WIDTH, HOME_CARD_BAR_HEIGHT)
+            # the bar stops short of its words, and of the box before them
+            short = HOME_CARD_BUILT_TEXT_WIDTH
+            if self.complete_button is not None:
+                short = max(short, self.rect().width() - HOME_CARD_PAD - self.complete_button.x()
+                            + HOME_CARD_COMPLETE_GAP)
+            bar = QRectF(HOME_CARD_PAD, HOME_CARD_BAR_TOP + low, inner - short, HOME_CARD_BAR_HEIGHT)
             painter.setPen(Qt.NoPen)
             painter.setBrush(QColor(HOME_CARD_BAR_BG))
             painter.drawRoundedRect(bar, HOME_CARD_BAR_HEIGHT / 2, HOME_CARD_BAR_HEIGHT / 2)
+            # green as it goes up; a light grey once all of it stands - the
+            # project complete, the way its own map shows it (see show_done)
+            whole = share >= 1
             if share > 0:
                 filled = QRectF(bar.left(), bar.top(), max(bar.width() * share, HOME_CARD_BAR_HEIGHT), bar.height())
-                painter.setBrush(QColor(HOME_CARD_BUILT_COLOR))
+                painter.setBrush(QColor(HOME_CARD_COMPLETE_COLOR if whole else HOME_CARD_BUILT_COLOR))
                 painter.drawRoundedRect(filled, HOME_CARD_BAR_HEIGHT / 2, HOME_CARD_BAR_HEIGHT / 2)
-            words = "All built" if share >= 1 else f"{summary['done']}/{summary['total']} built"
+            words = self.bar_words()
             paint_card_text(painter, scale,
-                            QRectF(bar.right(), bar.center().y() - HOME_CARD_SMALL_SIZE,
-                                   HOME_CARD_BAR_TEXT_WIDTH, HOME_CARD_SMALL_SIZE * 2),
+                            QRectF(HOME_CARD_PAD + inner - HOME_CARD_BUILT_TEXT_WIDTH,
+                                   bar.center().y() - HOME_CARD_SMALL_SIZE,
+                                   HOME_CARD_BUILT_TEXT_WIDTH, HOME_CARD_SMALL_SIZE * 2),
                             words, HOME_CARD_SMALL_SIZE,
-                            HOME_CARD_BUILT_COLOR if share >= 1 else TEXT_MUTED,
+                            HOME_CARD_COMPLETE_COLOR if whole else TEXT_MUTED,
                             Qt.AlignRight | Qt.AlignVCenter)
 
 
 # The spot the next project will take, as a card of its own: a dashed
 # outline with a "+" in it, and a click on it starts that project there.
+# The same dashed card adds a resource type, and a node to one: `text` is
+# what it says under its cross, and `width` how wide it stands.
 class NewProjectCardItem(HomeCardItem):
-    def __init__(self, on_click):
-        super().__init__(on_click)
+    def __init__(self, on_click, text="New project", width=HOME_CARD_WIDTH, tip="Start a new project here",
+                 height=HOME_PROJECT_HEIGHT):
+        super().__init__(on_click, width, height)
+        self.text = text
         self.setZValue(0.5)
-        self.setToolTip("Start a new project here")
+        self.setToolTip(tip)
 
     def paint(self, painter, option, widget=None):
         view = painting_view(widget)
@@ -15773,57 +17555,30 @@ class NewProjectCardItem(HomeCardItem):
         painter.drawPath(self.shape_path())
         # the cross and the words under it, centered in the card as one
         words = HOME_CARD_TEXT_SIZE * 1.4
-        top = (HOME_CARD_HEIGHT - HOME_GHOST_PLUS_SIZE - HOME_GHOST_GAP - words) / 2
-        cross = QPointF(HOME_CARD_WIDTH / 2, top + HOME_GHOST_PLUS_SIZE / 2)
+        top = (self.rect().height() - HOME_GHOST_PLUS_SIZE - HOME_GHOST_GAP - words) / 2
+        cross = QPointF(self.rect().width() / 2, top + HOME_GHOST_PLUS_SIZE / 2)
         half = HOME_GHOST_PLUS_SIZE / 2
         painter.setPen(screen_pen(painter, QPen(color, HOME_GHOST_PLUS_WIDTH, Qt.SolidLine, Qt.RoundCap), scale))
         painter.drawLine(QPointF(cross.x() - half, cross.y()), QPointF(cross.x() + half, cross.y()))
         painter.drawLine(QPointF(cross.x(), cross.y() - half), QPointF(cross.x(), cross.y() + half))
         paint_card_text(painter, scale,
-                        QRectF(0, top + HOME_GHOST_PLUS_SIZE + HOME_GHOST_GAP, HOME_CARD_WIDTH, words),
-                        "New project", HOME_CARD_TEXT_SIZE, color, Qt.AlignCenter)
+                        QRectF(0, top + HOME_GHOST_PLUS_SIZE + HOME_GHOST_GAP, self.rect().width(), words),
+                        self.text, HOME_CARD_TEXT_SIZE, color, Qt.AlignCenter)
 
 
-# A project's line to the hub. Straight up where nothing is in its way, as a
-# machine's is; from a card with another card over it, it steps aside first -
-# up a block, across into the gap beside the card, and up that gap - rather
-# than running on behind the card above as if it fed that one.
-HOME_LINE_TURN = GRID_SQUARE / 4    # the rounding at each of its corners
-
+# A project's line to the hub: a power line like a machine's, on a lane of
+# its own (see PowerEdge.set_lane and HomePage.route_power)
 class HubPowerEdge(PowerEdge):
-    def set_route(self, box_top, rail_y, power_point, gutter_x=None):
-        if gutter_x is None:
-            self.set_ends(box_top, rail_y, power_point)
-            return
-        reach = border_arrow_reach()
-        if self.feeding:
-            box_top = QPointF(box_top.x(), box_top.y() - reach)
-        else:
-            power_point = QPointF(power_point.x(), power_point.y() + reach)
-        self.top, self.end = box_top, power_point
-        self.rail_y = min(rail_y, box_top.y())
-        turn = HOME_LINE_TURN
-        aside = box_top.y() - GRID_SQUARE / 2 - reach   # the height it steps aside at
-        way = 1 if gutter_x > box_top.x() else -1
-        path = QPainterPath(box_top)
-        path.lineTo(box_top.x(), aside + turn)
-        path.quadTo(box_top.x(), aside, box_top.x() + way * turn, aside)
-        path.lineTo(gutter_x - way * turn, aside)
-        path.quadTo(gutter_x, aside, gutter_x, aside - turn)
-        path.lineTo(gutter_x, self.rail_y)
-        pull = max(abs(power_point.y() - self.rail_y), GRID_SQUARE)
-        path.cubicTo(QPointF(gutter_x, self.rail_y - pull),
-                     QPointF(power_point.x(), self.rail_y - pull * 0.4), power_point)
-        self.setPath(path)
+    pass
 
 
-# "Page 2", left of the hub's row for that page - the same numbers as the
+# "Page 2", before that page's first card on the hub's line - the same numbers as the
 # page chips over the tab row
 class PageLabelItem(QGraphicsItem):
     def __init__(self, number):
         super().__init__()
         self.text = f"Page {number}"
-        self.box = QRectF(0, 0, HOME_PAGE_LABEL_WIDTH, HOME_CARD_HEIGHT)
+        self.box = QRectF(0, 0, HOME_PAGE_LABEL_WIDTH, HOME_PROJECT_HEIGHT)
         self.setAcceptedMouseButtons(Qt.NoButton)
 
     def boundingRect(self):
@@ -15833,6 +17588,772 @@ class PageLabelItem(QGraphicsItem):
         scale = view_scale(painting_view(widget), painter)
         paint_card_text(painter, scale, self.box, self.text, HOME_PAGE_LABEL_SIZE, TEXT_FAINT,
                         Qt.AlignRight | Qt.AlignVCenter, bold=True)
+
+
+# ---- the hub's resource nodes ----
+#
+# Under the projects, a section of its own: a card per resource type, left to
+# right - its picture, its name and all the factory takes of it - and, opened
+# up, the nodes of that type standing to its right, each with its purity and
+# how much of it is used. A type shut connects to every project taking it;
+# opened, each of its nodes connects to the projects it feeds instead.
+RESOURCE_SECTION_GAP = GRID_SQUARE * 6       # from the projects' bottom down to the section's title:
+                                             # room for its lines to be followed
+RESOURCE_TYPE_WIDTH = GRID_SQUARE * 3           # at least: wider for a longer name or rate
+RESOURCE_TYPE_HEIGHT = HOME_CARD_HEIGHT          # as tall as a node card
+RESOURCE_TYPE_TOP = 24                          # its picture, its name beside it
+RESOURCE_TYPE_NAME_SIZE = 42
+RESOURCE_TYPE_NAME_LINE = 48                    # a line of it: a word a line
+RESOURCE_TYPE_LABEL_SIZE = 25                   # "Max output", "Needed", how many nodes
+RESOURCE_TYPE_VALUE_SIZE = 31
+RESOURCE_TYPE_LABEL_LINE = 30                   # a rate's label, and its value under it
+RESOURCE_TYPE_VALUE_LINE = 40
+RESOURCE_TYPE_ROW_GAP = 8                       # between one rate and the next
+RESOURCE_TYPE_TEXT_GAP = 18                     # from the picture to the name beside it
+
+RESOURCE_NODE_WIDTH = GRID_SQUARE * 4
+RESOURCE_NEW_NODE_WIDTH = GRID_SQUARE * 2
+RESOURCE_NODE_GAP = GRID_STEP * 2            # between two nodes of a type, and the last of them and its type
+RESOURCE_TYPE_GAP = GRID_SQUARE * 3 / 4      # between one type, opened or not, and the next
+RESOURCE_FRAME_PAD = 14                      # an opened type's outline reaching past its cards
+RESOURCE_FRAME_GROUND = QColor(NODE_BG).darker(118)   # ...and the one shade inside it, under them
+RESOURCE_PICTURE = 80
+RESOURCE_TYPE_ROWS_TOP = RESOURCE_TYPE_TOP + RESOURCE_PICTURE + 14   # its rates, under its picture
+RESOURCE_TYPE_ROW_HEIGHT = RESOURCE_TYPE_LABEL_LINE + RESOURCE_TYPE_VALUE_LINE
+RESOURCE_TYPE_COUNT_TOP = 272                   # how many nodes, and how much of them is used...
+RESOURCE_TYPE_COUNT_HEIGHT = 32
+RESOURCE_TYPE_BAR_TOP = 312                     # ...over the bar saying it, along its bottom
+RESOURCE_CHEVRON = 22                        # the arrow saying which way a type's nodes open
+RESOURCE_STRIP_WIDTH = GRID_STEP * 2         # the strip down a type's right side that opens its nodes
+RESOURCE_STRIP_HOVER = QColor(255, 255, 255, 20)
+RESOURCE_STRIP_DIVIDER = QColor(255, 255, 255, 30)
+RESOURCE_LINE_WIDTH = 3                      # px on screen, however far in
+RESOURCE_LINE_LIT_WIDTH = 5                  # px: a picked node's lines, brought up...
+RESOURCE_LINE_LIT_LIGHTER = 150              # ...and brighter, its arrows with it
+RESOURCE_SHORT_COLOR = POWER_DRAWN_COLOR     # a type asked for more than its nodes give
+RESOURCE_LEVEL_TOP = 296                     # a node's usage bar, marked at each extractor level
+RESOURCE_LEVEL_HEIGHT = 10
+RESOURCE_CHIP_TOP = HOME_CARD_PAD + HOME_MENU_BUTTON + 8   # a node card's values, under its number
+RESOURCE_CHIP_HEIGHT = 46
+RESOURCE_CHIP_GAP = 10
+RESOURCE_CHIP_PAD = 12                       # its words in from its ends
+RESOURCE_CHIP_CARET = 14                     # the small arrow at its right end
+RESOURCE_CHIP_SIZE = 24
+RESOURCE_CHIP_MIN_SIZE = 14                  # shrunk down to this for the three of them to fit
+RESOURCE_CHIP_REOPEN_S = 0.3                 # a press this soon after its dropdown shut only shut it
+RESOURCE_CHIP_BG = QColor(255, 255, 255, 14)
+RESOURCE_CHIP_HOVER_BG = QColor(255, 255, 255, 30)
+RESOURCE_USAGE_TOP = 204                     # the line saying how much of a node is used, over its bar
+RESOURCE_LEVEL_MARK = "#c8c8c8"              # the mark across it where a level of extractor tops out
+RESOURCE_LEVEL_MARK_CURRENT = 0.75           # ...this much of it over the bar's ground for the level on the node now
+RESOURCE_LEVEL_MARK_OTHER = 0.25             # ...and this much for the others
+RESOURCE_OVERCLOCK_COLOR = "#7fb0f0"         # an overclock's own marks, and the clock written on its chip
+RESOURCE_LEVEL_MARK_WIDTH = 2
+RESOURCE_LEVEL_STOP = 4                      # a level's stop across the bar: a small square block
+RESOURCE_CLOCK_LABEL_SIZE = 18               # an overclock's rate, over its mark
+RESOURCE_LABEL_SPACE = 6                     # the least room between two rates written along the bar
+RESOURCE_LEVEL_MARK_REACH = 5                # how far it stands out over and under the bar
+
+# the bar along a resource card's bottom: how much of what it can give is used
+def paint_usage_bar(painter, rect, used, color):
+    bar = QRectF(rect.left(), rect.top(), rect.width(), HOME_CARD_BAR_HEIGHT)
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QColor(HOME_CARD_BAR_BG))
+    painter.drawRoundedRect(bar, HOME_CARD_BAR_HEIGHT / 2, HOME_CARD_BAR_HEIGHT / 2)
+    if used > 0:
+        filled = QRectF(bar.left(), bar.top(), max(bar.width() * min(used, 1.0), HOME_CARD_BAR_HEIGHT), bar.height())
+        painter.setBrush(QColor(color))
+        painter.drawRoundedRect(filled, HOME_CARD_BAR_HEIGHT / 2, HOME_CARD_BAR_HEIGHT / 2)
+
+# An opened type's outline: its card's own, stretched round every card of
+# its nodes too - one shape in the type's color holding all of them - while
+# the card's own border stands down (see ResourceTypeCardItem.paint). Laid
+# again round the cards wherever they are, so it grows and shrinks with them.
+class ResourceFrameItem(QGraphicsItem):
+    def __init__(self, item):
+        super().__init__()
+        self.color = QColor(resource_color(item))
+        self.box = QRectF()
+        # how far out past its cards it stands, 0 to 1 of RESOURCE_FRAME_PAD:
+        # at 0 it is the type card's own outline, which it grows out of as its
+        # type opens and shrinks back into as it folds (see HomePage)
+        self.level = 1.0
+        # the one ground inside it, under all its cards and the air between
+        # them: an item of its own, the outline itself standing over the cards
+        self.ground = ResourceFrameGround(self)
+        # over the cards: it never fills, and takes no click, but where it
+        # meets the type card's own edge - growing out of it or shrinking
+        # back onto it - it is its outline that shows, not the card's grey
+        self.setZValue(1.5)
+        self.setAcceptedMouseButtons(Qt.NoButton)
+
+    def set_box(self, rect):
+        if rect != self.box:
+            self.prepareGeometryChange()
+            self.box = QRectF(rect)
+            self.ground.prepareGeometryChange()
+            self.ground.update()
+
+    def radius(self):
+        return NODE_RADIUS + RESOURCE_FRAME_PAD * self.level
+
+    def boundingRect(self):
+        return self.box.adjusted(-NODE_BORDER_WIDTH, -NODE_BORDER_WIDTH, NODE_BORDER_WIDTH, NODE_BORDER_WIDTH)
+
+    def paint(self, painter, option, widget=None):
+        if self.box.isEmpty():
+            return
+        scale = view_scale(painting_view(widget), painter)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(screen_pen(painter, QPen(self.color, NODE_BORDER_WIDTH), scale))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(self.box, self.radius(), self.radius())
+
+# An opened type's frame's ground: one even shade inside its outline, under
+# its cards, so the type and its nodes read as the one thing
+class ResourceFrameGround(QGraphicsItem):
+    def __init__(self, frame):
+        super().__init__()
+        self.frame = frame
+        self.setZValue(0.6)   # under every card, over the lines coming down to them
+        self.setAcceptedMouseButtons(Qt.NoButton)
+
+    def boundingRect(self):
+        return self.frame.box
+
+    def paint(self, painter, option, widget=None):
+        if self.frame.box.isEmpty():
+            return
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(RESOURCE_FRAME_GROUND)
+        painter.drawRoundedRect(self.frame.box, self.frame.radius(), self.frame.radius())
+
+# "Resource Nodes", left of the section's first type, a word a line - the way
+# a page's label stands before its first project
+class ResourceLabelItem(QGraphicsItem):
+    WORDS = ("Resource", "Nodes")
+
+    def __init__(self):
+        super().__init__()
+        font = scene_font(QApplication.font(), HOME_PAGE_LABEL_SIZE)
+        font.setBold(True)
+        width = max(QFontMetricsF(font).horizontalAdvance(word) for word in self.WORDS) + 4
+        self.box = QRectF(0, 0, width, RESOURCE_TYPE_HEIGHT)
+        self.setAcceptedMouseButtons(Qt.NoButton)
+
+    def boundingRect(self):
+        return self.box
+
+    def rect(self):   # laid out alongside the cards, which are read by theirs
+        return self.box
+
+    def paint(self, painter, option, widget=None):
+        scale = view_scale(painting_view(widget), painter)
+        line = HOME_PAGE_LABEL_SIZE * 1.25
+        first = (self.box.height() - line * len(self.WORDS)) / 2
+        for at, word in enumerate(self.WORDS):
+            paint_card_text(painter, scale, QRectF(0, first + at * line, self.box.width(), line), word,
+                            HOME_PAGE_LABEL_SIZE, TEXT_FAINT, Qt.AlignRight | Qt.AlignVCenter, bold=True)
+
+# The strip down a type's right side, its whole height: a click opens its
+# nodes out to the right, or folds them back. An arrow in its middle says
+# which, lit with the strip under the mouse.
+class ResourceExpandStrip(QGraphicsItem):
+    def __init__(self, card, on_click):
+        super().__init__(card)
+        self.card = card
+        self.on_click = on_click
+        width = card.rect().width()
+        self.box = QRectF(width - RESOURCE_STRIP_WIDTH, 0, RESOURCE_STRIP_WIDTH, card.rect().height())
+        self.hovered = False
+        self.setAcceptHoverEvents(True)
+        self.setAcceptedMouseButtons(Qt.LeftButton)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("Fold its nodes back" if card.expanded else "Show its nodes")
+
+    def boundingRect(self):
+        return self.box
+
+    # as tall as what it stands beside: its card, or - opened - the frame,
+    # whose node cards stand taller than the type's own
+    def set_height(self, height):
+        if height != self.box.height():
+            self.prepareGeometryChange()
+            self.box.setHeight(height)
+
+    def hoverEnterEvent(self, event):
+        self.hovered = True
+        self.update()
+
+    def hoverLeaveEvent(self, event):
+        self.hovered = False
+        self.update()
+
+    def mousePressEvent(self, event):
+        event.accept()   # kept off the card
+
+    def mouseReleaseEvent(self, event):
+        event.accept()
+        if self.box.contains(event.pos()):
+            self.on_click()
+
+    def paint(self, painter, option, widget=None):
+        scale = view_scale(painting_view(widget), painter)
+        painter.setRenderHint(QPainter.Antialiasing)
+        if self.hovered:
+            ground = QPainterPath()
+            if self.pos().x() > 0.5:
+                # out at its frame's end: rounded on the frame's side, square
+                # against the divider on its left
+                ground.addRoundedRect(self.box, NODE_RADIUS, NODE_RADIUS)
+                left = QPainterPath()
+                left.addRect(QRectF(self.box.left(), self.box.top(), self.box.width() / 2, self.box.height()))
+                painter.fillPath(ground.united(left), RESOURCE_STRIP_HOVER)
+            else:
+                # inside the card's own rounded right end
+                ground.addRect(self.box)
+                painter.fillPath(self.card.shape_path().intersected(ground), RESOURCE_STRIP_HOVER)
+        painter.setPen(screen_pen(painter, QPen(RESOURCE_STRIP_DIVIDER, 2), scale))
+        inset = HOME_CARD_PAD / 2
+        painter.drawLine(QPointF(self.box.left(), self.box.top() + inset),
+                         QPointF(self.box.left(), self.box.bottom() - inset))
+        middle = self.box.center()
+        way = 1 if self.card.expanded else -1
+        arrow = QPainterPath(QPointF(middle.x() + way * RESOURCE_CHEVRON / 2, middle.y() - RESOURCE_CHEVRON))
+        arrow.lineTo(middle.x() - way * RESOURCE_CHEVRON / 2, middle.y())
+        arrow.lineTo(middle.x() + way * RESOURCE_CHEVRON / 2, middle.y() + RESOURCE_CHEVRON)
+        lit = 1.0 if self.hovered else 0.0
+        painter.setPen(screen_pen(painter, QPen(blend_color(TEXT_FAINT, TEXT_STRONG, lit), 5,
+                                                Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin), scale))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawPath(arrow)
+
+# The cross in a node card's corner, taking the node off the hub
+class CardCrossButton(CardMenuButton):
+    def __init__(self, color, on_click, parent=None):
+        super().__init__(color, on_click, parent)
+        self.setToolTip("Remove this node")
+
+    def paint_mark(self, painter):
+        size = self.box.width()
+        half = size * 0.16
+        middle = self.box.center()
+        painter.setPen(QPen(self.color, size / 14, Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(middle + QPointF(-half, -half), middle + QPointF(half, half))
+        painter.drawLine(middle + QPointF(half, -half), middle + QPointF(-half, half))
+
+# One resource type: drawn the way a node of the graph is - its picture, its
+# name and the rate of it the whole factory takes - with what its nodes give
+# under that. The strip down its right side opens its nodes out to its right,
+# or folds them back; the card itself takes no click.
+# How wide every type card stands: wide enough for the longest word of their
+# names, beside the picture, and of the rates stacked under it - clear of the
+# strip, out to the next fine line of the grid. All of them the one width,
+# so the row reads as a row.
+def resource_type_width(shares):
+    name_font = scene_font(QApplication.font(), RESOURCE_TYPE_NAME_SIZE)
+    name_font.setBold(True)
+    label_font = scene_font(QApplication.font(), RESOURCE_TYPE_LABEL_SIZE)
+    value_font = scene_font(QApplication.font(), RESOURCE_TYPE_VALUE_SIZE)
+    value_font.setBold(True)
+    word, rate = 0.0, 0.0
+    for item in RESOURCES["types"]:
+        # a name of two words stands on two lines: its longest word is its width
+        for part in resource_name_lines(item):
+            word = max(word, QFontMetricsF(name_font).horizontalAdvance(part))
+        share = shares.get(item)
+        if share is not None:
+            for label, value in resource_type_rows(item, share):
+                rate = max(rate, QFontMetricsF(label_font).horizontalAdvance(label),
+                           QFontMetricsF(value_font).horizontalAdvance(value))
+    inside = max(RESOURCE_PICTURE + RESOURCE_TYPE_TEXT_GAP + word, rate)
+    needed = HOME_CARD_PAD + inside + HOME_CARD_PAD + RESOURCE_STRIP_WIDTH
+    return max(RESOURCE_TYPE_WIDTH, math.ceil(needed / GRID_STEP) * GRID_STEP)
+
+# a type's name as its card writes it: a line a word, for two of them
+def resource_name_lines(item):
+    return resource_name(item).split(" ", 1)
+
+# what a type's card says under its picture: (label, value) a row
+def resource_type_rows(item, share):
+    return [("Max output", rate_text(item, share["capacity"])),
+            ("Needed", rate_text(item, share["demand"]))]
+
+class ResourceTypeCardItem(HomeCardItem):
+    def __init__(self, item, share, count, on_click, on_menu, width=RESOURCE_TYPE_WIDTH):
+        super().__init__(on_click, width, RESOURCE_TYPE_HEIGHT)
+        self.item = item
+        self.share = share         # its line of allocate_resources
+        self.count = count         # how many nodes of it there are
+        self.on_menu = on_menu
+        self.expanded = item in RESOURCES["expanded"]
+        self.color = QColor(resource_color(item))
+        path = resource_node_picture(item)
+        drawing = picture_drawing(path)
+        if drawing is not None:
+            picture = SymbolItem(drawing[0], drawing[1], RESOURCE_PICTURE, self)
+        else:
+            picture = PictureItem(path, RESOURCE_PICTURE, RESOURCE_PICTURE, self)
+        picture.setPos(HOME_CARD_PAD, RESOURCE_TYPE_TOP)
+        # the strip down its right side is what opens it: the card itself
+        # takes no click, and does not light up as if it did
+        self.on_click = lambda: None
+        self.setCursor(Qt.ArrowCursor)
+        self.setAcceptHoverEvents(False)
+        self.strip = ResourceExpandStrip(self, on_click)
+        lines = [f"<b>{html.escape(resource_name(item))}</b>",
+                 f"Taken: {rate_text(item, share['demand'])}, "
+                 f"{rate_text(item, share['supplied'])} of it through linked nodes",
+                 f"{count} node{'' if count == 1 else 's'} giving {rate_text(item, share['capacity'])}"]
+        if share["short"] > 0:
+            lines.append(f"<span style='color:{RESOURCE_SHORT_COLOR}'>Short by {rate_text(item, share['short'])}</span>")
+        lines.append(f"<i>The strip on its right {'folds its nodes back' if self.expanded else 'shows its nodes'} - right click for more</i>")
+        self.setToolTip("<br>".join(lines))
+
+    def contextMenuEvent(self, event):
+        event.accept()
+        self.on_menu(event.screenPos())
+
+    def paint(self, painter, option, widget=None):
+        scale = view_scale(painting_view(widget), painter)
+        painter.setRenderHint(QPainter.Antialiasing)
+        shape = self.shape_path()
+        # opened, its outline is the frame round it and its nodes instead
+        border = QColor(self.color) if not self.expanded else QColor(OUTPUT_FIELD_BORDER)
+        painter.setPen(screen_pen(painter, QPen(border, NODE_BORDER_WIDTH if not self.expanded else 2), scale))
+        painter.setBrush(node_ground(NODE_BG, self.hover))
+        painter.drawPath(shape)
+        width = self.rect().width() - RESOURCE_STRIP_WIDTH   # what the strip down its right leaves
+        inner = width - 2 * HOME_CARD_PAD
+        # its name beside its picture, a line a word, the lines level with
+        # the picture's middle
+        name_left = HOME_CARD_PAD + RESOURCE_PICTURE + RESOURCE_TYPE_TEXT_GAP
+        lines = resource_name_lines(self.item)
+        first = RESOURCE_TYPE_TOP + (RESOURCE_PICTURE - RESOURCE_TYPE_NAME_LINE * len(lines)) / 2
+        for at, words in enumerate(lines):
+            paint_card_text(painter, scale,
+                            QRectF(name_left, first + at * RESOURCE_TYPE_NAME_LINE,
+                                   HOME_CARD_PAD + inner - name_left, RESOURCE_TYPE_NAME_LINE),
+                            words, RESOURCE_TYPE_NAME_SIZE, TEXT_STRONG, bold=True)
+
+        # under it, what its nodes give at most now and what the projects
+        # need of it - in red when that is more than they give - each value
+        # under its label
+        share = self.share
+        text_left, text_width = HOME_CARD_PAD, inner
+        colors = [self.color.name(), RESOURCE_SHORT_COLOR if share["short"] > 0 else TEXT_STRONG]
+        for at, ((label, value), color) in enumerate(zip(resource_type_rows(self.item, share), colors)):
+            top = RESOURCE_TYPE_ROWS_TOP + at * (RESOURCE_TYPE_ROW_HEIGHT + RESOURCE_TYPE_ROW_GAP)
+            paint_card_text(painter, scale, QRectF(text_left, top, text_width, RESOURCE_TYPE_LABEL_LINE),
+                            label, RESOURCE_TYPE_LABEL_SIZE, TEXT_MUTED)
+            paint_card_text(painter, scale, QRectF(text_left, top + RESOURCE_TYPE_LABEL_LINE, text_width,
+                                                   RESOURCE_TYPE_VALUE_LINE),
+                            value, RESOURCE_TYPE_VALUE_SIZE, color, bold=True)
+        # how many nodes there are and how much of them is used, over the bar
+        count = self.count
+        row = QRectF(HOME_CARD_PAD, RESOURCE_TYPE_COUNT_TOP, inner, RESOURCE_TYPE_COUNT_HEIGHT)
+        if not count:
+            paint_card_text(painter, scale, row, "No node yet", RESOURCE_TYPE_LABEL_SIZE, TEXT_FAINT)
+            return
+        paint_card_text(painter, scale, row, f"{count} node{'' if count == 1 else 's'}",
+                        RESOURCE_TYPE_LABEL_SIZE, TEXT_NORMAL)
+        used = share["supplied"] / share["capacity"] if share["capacity"] else 0.0
+        paint_card_text(painter, scale, row, f"{round(used * 100)}% used", RESOURCE_TYPE_LABEL_SIZE,
+                        TEXT_MUTED, Qt.AlignRight | Qt.AlignVCenter)
+        paint_usage_bar(painter, QRectF(HOME_CARD_PAD, RESOURCE_TYPE_BAR_TOP, inner, HOME_CARD_BAR_HEIGHT),
+                        used, RESOURCE_SHORT_COLOR if share["short"] > 0 else self.color.name())
+
+# One of a node card's values that can be changed: its words on a soft
+# ground, with a small arrow after them, lighter under the mouse - and a
+# click drops what it can be changed to (`on_click`, with the screen point
+# under its bottom left corner).
+class ResourceChipItem(QGraphicsItem):
+    # `on_click` None: it only says, nothing to drop - no arrow, no click
+    def __init__(self, box, text, color, on_click, tip, parent, size=RESOURCE_CHIP_SIZE):
+        super().__init__(parent)
+        self.box = QRectF(box)
+        self.text = text
+        self.color = QColor(color)
+        self.on_click = on_click
+        self.size = size
+        self.hovered = False
+        self.closed_at = 0.0       # when its dropdown last shut
+        self.swallowed = False     # this press only shut it
+        if on_click is not None:
+            self.setAcceptHoverEvents(True)
+            self.setAcceptedMouseButtons(Qt.LeftButton)
+            self.setCursor(Qt.PointingHandCursor)
+        else:
+            self.setAcceptedMouseButtons(Qt.NoButton)
+        self.setToolTip(tip)
+
+    def boundingRect(self):
+        return self.box
+
+    def hoverEnterEvent(self, event):
+        self.hovered = True
+        self.update()
+
+    def hoverLeaveEvent(self, event):
+        self.hovered = False
+        self.update()
+
+    # A click on it while its dropdown is open shuts the dropdown - which Qt
+    # does with that very press, then hands the press on here as well, and
+    # it opened again at once. A press coming the moment it shut is that one.
+    def mousePressEvent(self, event):
+        event.accept()   # kept off the card under it
+        self.swallowed = time.monotonic() - self.closed_at < RESOURCE_CHIP_REOPEN_S
+
+    def mouseReleaseEvent(self, event):
+        event.accept()
+        if self.swallowed:
+            self.swallowed = False
+            return
+        if not self.box.contains(event.pos()) or self.scene() is None or not self.scene().views():
+            return
+        view = self.scene().views()[0]
+        corner = view.mapFromScene(self.mapToScene(self.box.bottomLeft()))
+        try:
+            self.on_click(view.viewport().mapToGlobal(corner))   # the dropdown, until it shuts
+            self.closed_at = time.monotonic()
+        except RuntimeError:
+            pass   # the hub was built again from what was picked: this chip is gone
+
+    def paint(self, painter, option, widget=None):
+        scale = view_scale(painting_view(widget), painter)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(RESOURCE_CHIP_HOVER_BG if self.hovered else RESOURCE_CHIP_BG)
+        radius = self.box.height() / 4
+        painter.drawRoundedRect(self.box, radius, radius)
+        opens = self.on_click is not None
+        words = self.box.adjusted(RESOURCE_CHIP_PAD, 0,
+                                  -RESOURCE_CHIP_PAD - (RESOURCE_CHIP_CARET * 2 if opens else 0), 0)
+        paint_card_text(painter, scale, words, self.text, self.size, self.color.name(),
+                        Qt.AlignLeft | Qt.AlignVCenter, bold=True)
+        if not opens:
+            return
+        # the small arrow at its right end, saying it opens
+        tip = QPointF(self.box.right() - RESOURCE_CHIP_PAD - RESOURCE_CHIP_CARET / 2,
+                      self.box.center().y() + RESOURCE_CHIP_CARET / 3)
+        caret = QPainterPath(QPointF(tip.x() - RESOURCE_CHIP_CARET / 2, tip.y() - RESOURCE_CHIP_CARET / 2))
+        caret.lineTo(tip)
+        caret.lineTo(tip.x() + RESOURCE_CHIP_CARET / 2, tip.y() - RESOURCE_CHIP_CARET / 2)
+        painter.setPen(screen_pen(painter, QPen(QColor(TEXT_STRONG if self.hovered else TEXT_MUTED), 3,
+                                                Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin), scale))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawPath(caret)
+
+# One node of a type, out in the world. Its number in the top left corner
+# and the cross taking it off the hub in the top right; under them what can
+# be changed about it, each a click away - its purity, the extractor on it,
+# the projects it feeds - and under those how much of it is used, and the
+# bar saying so against what every level of extractor would give. The card
+# itself takes no click: its values do.
+# A node card's edge: faint grey, its type's frame round it carrying the
+# color - or, picked, an outline of its own in that color
+def node_card_edge(card, painter, scale):
+    if card.picked:
+        return screen_pen(painter, QPen(QColor(resource_color(card.node.item)), NODE_BORDER_WIDTH), scale)
+    return screen_pen(painter, QPen(QColor(OUTPUT_FIELD_BORDER), 2), scale)
+
+class ResourceNodeCardItem(HomeCardItem):
+    # `feeds` are the names of the projects it feeds; `on_menu(what, point)`
+    # drops the choices for "purity", "extractor" or "feeds" at a screen point
+    def __init__(self, node, number, used, feeds, on_menu, on_remove=None):
+        super().__init__(lambda: None, RESOURCE_NODE_WIDTH)
+        self.setAcceptHoverEvents(False)
+        self.setZValue(0.8)   # under its type's card, which it slides out from behind
+        self.node = node
+        self.picked = False   # clicked: its lines brought up (see HomePage.pick_resource)
+        self.number = number       # its place among its type's nodes, from 1
+        self.used = used           # what is taken of it, a minute
+        self.cross = None
+        if on_remove is not None:
+            self.cross = CardCrossButton(TEXT_MUTED, on_remove, self)
+            # as far in from the card's right edge as from its top
+            self.cross.setPos(self.rect().width() - HOME_CARD_PAD - HOME_MENU_BUTTON, HOME_CARD_PAD)
+        inner = self.rect().width() - 2 * HOME_CARD_PAD
+        purity = node.purity.capitalize()
+        clock = f"{round(shard_clock(node.shards) * 100)}%"
+        words = [purity, node.extractor.display_name, clock]
+
+        # the three of them on the one row, whole: their words as big as
+        # lets all three fit across the card
+        def chip_width(text, size):
+            font = scene_font(QApplication.font(), size)
+            font.setBold(True)
+            return QFontMetricsF(font).horizontalAdvance(text) + 2 * RESOURCE_CHIP_PAD + RESOURCE_CHIP_CARET * 2 + 4
+
+        size = RESOURCE_CHIP_SIZE
+        while size > RESOURCE_CHIP_MIN_SIZE and (
+                sum(chip_width(text, size) for text in words) + 2 * RESOURCE_CHIP_GAP > inner):
+            size -= 1
+        widths = [chip_width(text, size) for text in words]
+        spare = inner - sum(widths) - 2 * RESOURCE_CHIP_GAP
+        if spare < 0:   # still too wide at the smallest: the name gives way
+            widths[1] = max(widths[1] + spare, 2 * RESOURCE_CHIP_PAD)
+        left = HOME_CARD_PAD
+        boxes = []
+        for width in widths:
+            boxes.append(QRectF(left, RESOURCE_CHIP_TOP, width, RESOURCE_CHIP_HEIGHT))
+            left += width + RESOURCE_CHIP_GAP
+        self.purity_chip = ResourceChipItem(boxes[0], purity, RESOURCE_PURITY_COLORS[node.purity],
+                                            lambda at: on_menu("purity", at), "Change its purity", self, size)
+        self.extractor_chip = ResourceChipItem(boxes[1], node.extractor.display_name, TEXT_NORMAL,
+                                               lambda at: on_menu("extractor", at),
+                                               "Change the extractor on it", self, size)
+        # how far it is overclocked, by the power shards in it - in blue once it is
+        self.clock_chip = ResourceChipItem(boxes[2], clock, RESOURCE_OVERCLOCK_COLOR if node.shards else TEXT_MUTED,
+                                           lambda at: on_menu("shards", at),
+                                           f"Overclock: {node.shards} power shard{'' if node.shards == 1 else 's'}",
+                                           self, size)
+        # the projects it feeds, said and nothing more: a project picks its
+        # nodes in its own map, from the box digging it up
+        feeding = ("Feeds " + ", ".join(feeds)) if feeds else "Feeds no project"
+        third = QRectF(HOME_CARD_PAD, RESOURCE_CHIP_TOP + RESOURCE_CHIP_HEIGHT + RESOURCE_CHIP_GAP,
+                       inner, RESOURCE_CHIP_HEIGHT)
+        self.feeds_chip = ResourceChipItem(third, feeding, TEXT_NORMAL if feeds else TEXT_MUTED, None,
+                                           "The projects it feeds - picked in each project's map, "
+                                           "from the box digging it up", self)
+        self.setToolTip(f"<b>{html.escape(resource_name(node.item))} node {number}</b><br>"
+                        f"{purity}, {html.escape(node.extractor.display_name)}<br>"
+                        f"Gives {rate_text(node.item, node.capacity())}, {rate_text(node.item, used)} of it used")
+
+    def paint(self, painter, option, widget=None):
+        scale = view_scale(painting_view(widget), painter)
+        painter.setRenderHint(QPainter.Antialiasing)
+        node = self.node
+        shape = self.shape_path()
+        painter.setPen(node_card_edge(self, painter, scale))
+        painter.setBrush(node_ground(NODE_BG, self.hover))
+        painter.drawPath(shape)
+        inner = self.rect().width() - 2 * HOME_CARD_PAD
+        # its number, level with the cross in the other corner
+        paint_card_text(painter, scale, QRectF(HOME_CARD_PAD, HOME_CARD_PAD, inner / 2, HOME_MENU_BUTTON),
+                        f"#{self.number}", HOME_CARD_NAME_SIZE, TEXT_STRONG,
+                        Qt.AlignLeft | Qt.AlignVCenter, bold=True)
+        # how much of it is used: the share on the left, the rates on the right
+        capacity = node.capacity()
+        used = self.used / capacity if capacity else 0.0
+        line = QRectF(HOME_CARD_PAD, RESOURCE_USAGE_TOP, inner, HOME_CARD_NET_SIZE * 1.4)
+        paint_card_text(painter, scale, line, f"{round(used * 100)}% used", HOME_CARD_NET_SIZE,
+                        TEXT_STRONG if used > 0 else TEXT_FAINT, Qt.AlignLeft | Qt.AlignVCenter, bold=True)
+        # what is taken of it - what it gives at most is under the bar
+        paint_card_text(painter, scale, line, f"Uses {rate_text(node.item, self.used)}",
+                        HOME_CARD_SMALL_SIZE, TEXT_NORMAL, Qt.AlignRight | Qt.AlignVCenter)
+        self.paint_levels(painter, scale, inner)
+
+    # One bar for how much of the node is used, against what it could be made
+    # to give. A grey mark where the extractor on it tops out and where each
+    # better one would - every miner mark above it, for an ore - with what
+    # each gives written under it; a blue mark where each power shard would
+    # take each of them, the extractor's own three written over the bar.
+    # Whether a better miner or a shard would take the load, read at a glance.
+    # The one mark brightest is what the node gives now: its extractor's, or
+    # its overclock's.
+    def paint_levels(self, painter, scale, inner):
+        node = self.node
+        share_of = RESOURCE_PURITY_SHARE[node.purity]
+        levels = resource_levels(node)
+        at = levels.index(node.extractor) if node.extractor in levels else 0
+        higher = levels[at:]   # the ones below it no longer anything to reach for
+
+        # every mark by the rate it stands at - a level's and a shard's
+        # landing on the one rate sharing it: {rate: {"level", "clock"}}
+        marks = {}
+
+        def add(given, **what):
+            spot = marks.setdefault(round(given, 4), {"rate": given, "level": None, "clock": None})
+            spot.update(what)
+
+        for machine in higher:
+            base = extraction_rate(node.item, machine) * share_of
+            add(base, level=machine)
+            for shards in range(1, RESOURCE_SHARDS_MAX + 1):
+                add(base * shard_clock(shards), clock=(machine, shards))
+        most = max((spot["rate"] for spot in marks.values()), default=0.0)
+
+        bar = QRectF(HOME_CARD_PAD, RESOURCE_LEVEL_TOP, inner, RESOURCE_LEVEL_HEIGHT)
+        radius = RESOURCE_LEVEL_HEIGHT / 2
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(HOME_CARD_BAR_BG))
+        # rounded where it starts, square where it ends - the fill on it too
+        painter.drawRoundedRect(bar, radius, radius)
+        painter.drawRect(QRectF(bar.right() - radius, bar.top(), radius, bar.height()))
+        share = self.used / most if most else 0.0
+        if share > 0:
+            # rounded where it starts, square where it stops
+            filled = QRectF(bar.left(), bar.top(), max(bar.width() * min(share, 1.0), RESOURCE_LEVEL_HEIGHT), bar.height())
+            painter.setBrush(QColor(resource_color(node.item)))
+            painter.drawRoundedRect(filled, radius, radius)
+            painter.drawRect(QRectF(filled.right() - radius, filled.top(), radius, filled.height()))
+
+        def current(spot):
+            if node.shards:
+                return spot["clock"] == (node.extractor, node.shards)
+            return spot["level"] is node.extractor
+
+        top, bottom = bar.top() - RESOURCE_LEVEL_MARK_REACH, bar.bottom() + RESOURCE_LEVEL_MARK_REACH
+        label_font = scene_font(QApplication.font(), HOME_CARD_SMALL_SIZE)
+        label_font.setBold(True)
+
+        # A shard's clock a thin blue tick; a level of extractor a square
+        # stop across the bar, its name over it - Mk.1, Mk.2, Mk.3 - the
+        # one it runs at brightest. Under the bar, only the rate it gives now.
+        ordered = sorted(marks.values(), key=lambda spot: (not current(spot), spot["rate"]))
+        now = None
+        names = []   # (x, name, bright), written once every stop is down
+        for spot in ordered:
+            x = bar.left() + bar.width() * (spot["rate"] / most if most else 1.0)
+            lit = current(spot)
+            if lit:
+                now = (x, spot["rate"])
+            strength = RESOURCE_LEVEL_MARK_CURRENT if lit else RESOURCE_LEVEL_MARK_OTHER
+            grey = blend_color(HOME_CARD_BAR_BG, RESOURCE_LEVEL_MARK, strength)
+            blue = blend_color(HOME_CARD_BAR_BG, RESOURCE_OVERCLOCK_COLOR, strength)
+            if spot["level"] is not None:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(blue if lit and node.shards else grey)
+                painter.drawRect(QRectF(x - RESOURCE_LEVEL_STOP / 2, top, RESOURCE_LEVEL_STOP, bottom - top))
+                names.append((x, level_name(spot["level"]), spot["level"] is node.extractor))
+            else:
+                ink = blue if lit else blend_color(HOME_CARD_BAR_BG, RESOURCE_OVERCLOCK_COLOR, 0.45)
+                painter.setPen(screen_pen(painter, QPen(ink, RESOURCE_LEVEL_MARK_WIDTH, Qt.SolidLine, Qt.FlatCap),
+                                          scale))
+                painter.drawLine(QPointF(x, top), QPointF(x, bottom))
+        # Every level named over its stop, left to right: one crowding the
+        # one before is moved along past it rather than left out - and the
+        # lot moved back in should the last run off the bar's end
+        names.sort()
+        boxes, right = [], bar.left() - RESOURCE_LABEL_SPACE
+        for x, name, bright in names:
+            width = QFontMetricsF(label_font).horizontalAdvance(name) + 4
+            left = max(x - width / 2, right + RESOURCE_LABEL_SPACE, bar.left())
+            boxes.append([left, width, name, bright])
+            right = left + width
+        over_end = right - bar.right()
+        if over_end > 0:
+            for box in boxes:
+                box[0] -= over_end
+        for left, width, name, bright in boxes:
+            paint_card_text(painter, scale, QRectF(left, top - 3 - HOME_CARD_SMALL_SIZE * 1.4, width,
+                                                   HOME_CARD_SMALL_SIZE * 1.4),
+                            name, HOME_CARD_SMALL_SIZE, TEXT_STRONG if bright else TEXT_FAINT,
+                            Qt.AlignHCenter | Qt.AlignBottom, bold=bright)
+        if now is not None:
+            text = rate_text(node.item, now[1])
+            width = QFontMetricsF(label_font).horizontalAdvance(text) + 4
+            box = QRectF(now[0] - width / 2, bottom + 3, width, HOME_CARD_SMALL_SIZE * 1.5)
+            if box.right() > bar.right():
+                box.moveRight(bar.right())
+            if box.left() < bar.left():
+                box.moveLeft(bar.left())
+            paint_card_text(painter, scale, box, text, HOME_CARD_SMALL_SIZE,
+                            RESOURCE_OVERCLOCK_COLOR if node.shards else TEXT_STRONG,
+                            Qt.AlignHCenter | Qt.AlignTop, bold=True)
+
+# a level of extractor as the bar names it: a miner by its mark alone
+def level_name(machine):
+    name = machine.display_name
+    return name[len("Miner "):] if name.startswith("Miner ") else name
+
+# How far along its type's card a node card stands, folded in under it:
+# against its right side - or, one wider than the card, against its left,
+# never out past the card on the side of the types before it
+def tucked_under(type_card, card):
+    return max(0.0, type_card.rect().width() - card.rect().width())
+
+# The free water's card, first among the water type's nodes: what Water
+# Extractors draw, anywhere on water - nothing to set on it and no limit to
+# it, nor anything to link: every project pumping water takes from it.
+class FreeWaterCardItem(HomeCardItem):
+    def __init__(self, node, used, feeds):
+        super().__init__(lambda: None, RESOURCE_NODE_WIDTH)
+        self.setAcceptHoverEvents(False)
+        self.setZValue(0.8)   # under its type's card, which it slides out from behind
+        self.node = node
+        self.picked = False   # clicked: its lines brought up (see HomePage.pick_resource)
+        self.used = used
+        self.feeds = feeds
+        self.setToolTip("<b>Free water</b><br>Drawn by Water Extractors, anywhere on water: no node, no limit"
+                        f"<br>{rate_text(node.item, used)} pumped")
+
+    def paint(self, painter, option, widget=None):
+        scale = view_scale(painting_view(widget), painter)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(node_card_edge(self, painter, scale))
+        painter.setBrush(node_ground(NODE_BG, self.hover))
+        painter.drawPath(self.shape_path())
+        inner = self.rect().width() - 2 * HOME_CARD_PAD
+        paint_card_text(painter, scale, QRectF(HOME_CARD_PAD, HOME_CARD_PAD, inner, HOME_MENU_BUTTON),
+                        "Free water", HOME_CARD_NAME_SIZE, TEXT_STRONG, Qt.AlignLeft | Qt.AlignVCenter, bold=True)
+        paint_card_text(painter, scale, QRectF(HOME_CARD_PAD, RESOURCE_CHIP_TOP, inner, RESOURCE_CHIP_HEIGHT),
+                        "Water Extractors, anywhere", RESOURCE_CHIP_SIZE, TEXT_MUTED)
+        feeding = ("Feeds " + ", ".join(self.feeds)) if self.feeds else "No project pumps water"
+        paint_card_text(painter, scale,
+                        QRectF(HOME_CARD_PAD, RESOURCE_CHIP_TOP + RESOURCE_CHIP_HEIGHT + RESOURCE_CHIP_GAP,
+                               inner, RESOURCE_CHIP_HEIGHT),
+                        feeding, RESOURCE_CHIP_SIZE, TEXT_NORMAL if self.feeds else TEXT_FAINT)
+        line = QRectF(HOME_CARD_PAD, RESOURCE_USAGE_TOP, inner, HOME_CARD_NET_SIZE * 1.4)
+        paint_card_text(painter, scale, line, rate_text(self.node.item, self.used), HOME_CARD_NET_SIZE,
+                        TEXT_STRONG if self.used > 0 else TEXT_FAINT, Qt.AlignLeft | Qt.AlignVCenter, bold=True)
+        paint_card_text(painter, scale, line, "No limit", HOME_CARD_SMALL_SIZE, TEXT_MUTED,
+                        Qt.AlignRight | Qt.AlignVCenter)
+
+# the levels of extractor `node` could carry, in order: every miner mark for
+# a node a miner stands on, else just the one extractor it has
+def resource_levels(node):
+    if node.extractor.full_name.startswith("Build_MinerMk"):
+        return sorted((machine for machine in resource_extractors(node.item)
+                       if machine.full_name.startswith("Build_MinerMk")), key=lambda machine: machine.full_name)
+    return [node.extractor]
+
+# A resource running from a type, or one of its nodes, up to a project taking
+# it: in the type's color, under the cards, saying what goes along it
+class ResourceLineItem(QGraphicsPathItem):
+    def __init__(self, item, rate, project, source):
+        super().__init__()
+        self.item = item
+        self.project = project     # the project's card, at the top end
+        self.source = source       # the type's or node's card, at the bottom end
+        self.color = QColor(resource_color(item))
+        pen = QPen(self.color, RESOURCE_LINE_WIDTH)
+        pen.setCosmetic(True)
+        pen.setCapStyle(Qt.FlatCap)   # it starts at its arrow's tip, flush
+        self.setPen(pen)
+        self.setZValue(0.2)
+        self.setToolTip(f"{html.escape(resource_name(item))}: {rate_text(item, rate)} "
+                        f"to {html.escape(project.name)}")
+        # the arrow it leaves its node by, on the edge it comes out of,
+        # pointing up the way it goes - going with the line, lit or not
+        self.arrow = QGraphicsPolygonItem(self)
+        self.arrow.setPen(QPen(Qt.NoPen))
+        self.arrow.setBrush(self.color)
+
+    # `lit`: its node is picked - brighter and heavier, over the rest, its
+    # arrow brighter with it; every line solid either way
+    def set_lit(self, lit):
+        color = self.color.lighter(RESOURCE_LINE_LIT_LIGHTER) if lit else self.color
+        pen = self.pen()
+        pen.setColor(color)
+        pen.setWidthF(RESOURCE_LINE_LIT_WIDTH if lit else RESOURCE_LINE_WIDTH)
+        self.setPen(pen)
+        self.arrow.setBrush(color)
+        self.setZValue(0.3 if lit else 0.2)
+
+    # from `top`, a port along the project's bottom, down to `bottom`, one
+    # along the card's top - where its arrow stands: the line leaves from
+    # the arrow's tip
+    def set_ends(self, top, bottom):
+        self.arrow.setPolygon(border_arrow_points(bottom.x(), bottom.y(), True))
+        start = QPointF(bottom.x(), bottom.y() - border_arrow_reach())
+        pull = max((start.y() - top.y()) / 2, GRID_SQUARE / 2)
+        path = QPainterPath(top)
+        path.cubicTo(QPointF(top.x(), top.y() + pull), QPointF(start.x(), start.y() - pull), start)
+        self.setPath(path)
 
 
 # what the hub's power node reads: the whole grid - every project's net,
@@ -15937,6 +18458,12 @@ class HomePage(QWidget):
         self.labels = []                    # "Page n", one for each row
         self.slide = None                   # the glide running, if one is
         self.drag = None                    # a card being dragged to another place, while it is
+        self.resource_items = {}            # the resource section's cards, by key (see make_resources)
+        self.resource_frames = {}           # an opened type's outline round its nodes, by item
+        self.resource_leaving = {}          # ...and the cards of a type folding back, it still holds them
+        self.resource_lines = []
+        self.picked_resource = None         # the node clicked on: its lines brought up
+        self.resource_shares = {}           # allocate_resources, as the hub was last made
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -16020,7 +18547,7 @@ class HomePage(QWidget):
 
     def content_rect(self):
         rect = QRectF()
-        for card in list(self.cards.values()) + [self.ghost] + self.labels:
+        for card in list(self.cards.values()) + [self.ghost] + self.labels + list(self.resource_items.values()):
             if card is not None:
                 rect = rect.united(card.sceneBoundingRect())
         if self.hub is not None and self.hub.isVisible():
@@ -16035,47 +18562,76 @@ class HomePage(QWidget):
 
     # Where everything stands for `rows`: every card on its spot, the "New
     # project" card after the last of the page a new project would go on,
-    # each page's label beside its first line, and the power node over the
-    # cards. A page runs HOME_CARDS_PER_LINE cards to a line and on over the
-    # lines under it, and the next page starts on a line of its own.
-    # `lines` says which page each line belongs to and which of its cards
-    # the line starts at - what a card being dragged is placed by.
+    # each page's label before its first card, and the power node over the
+    # cards. Every page stands on the one line, one after the other, each
+    # brought in by its label - the first page's card at the start of the
+    # line, its label just before it.
     def layout(self, rows):
-        spots, labels, lines = {}, [], []
+        spots, labels = {}, []
         kept = self.tabs.kept_page() if self.tabs is not None else 0
         ghost_row = max((number for number, (m, _) in enumerate(rows) if m == kept), default=len(rows) - 1)
+        x = -HOME_PAGE_LABEL_WIDTH - HOME_PAGE_LABEL_GAP
         for number, (m, pages) in enumerate(rows):
-            first = len(lines)
             standing = [self.cards.get(page) for page in pages]
             if number == ghost_row and self.ghost is not None:
                 standing.append(self.ghost)
-            for line in range(max(1, math.ceil(len(standing) / HOME_CARDS_PER_LINE))):
-                lines.append((number, line * HOME_CARDS_PER_LINE))
-            labels.append(QPointF(-HOME_PAGE_LABEL_WIDTH - GRID_SQUARE / 2, first * HOME_CARD_PITCH_Y))
-            # along a line, each card after the one before it and the air
-            # between: a card widened for its outputs pushes the rest along
-            x = 0.0
-            for index, card in enumerate(standing):
-                line, column = divmod(index, HOME_CARDS_PER_LINE)
-                if column == 0:
-                    x = 0.0
+            if number:
+                # the page before ends close by: its label takes the air
+                # after that page's last card, not more room on top of it
+                x -= HOME_CARD_GAP_X - HOME_PAGE_LABEL_GAP
+            labels.append(QPointF(x, 0.0))
+            x += HOME_PAGE_LABEL_WIDTH + HOME_PAGE_LABEL_GAP
+            # each card after the one before it and the air between: a card
+            # widened for its outputs pushes the rest along
+            for card in standing:
                 if card is not None:
-                    spots[card] = QPointF(x, (first + line) * HOME_CARD_PITCH_Y)
+                    spots[card] = QPointF(x, 0.0)
                 x += (card.rect().width() if card is not None else HOME_CARD_WIDTH) + HOME_CARD_GAP_X
-        return spots, labels, self.hub_spot(spots), lines
+        hub = self.hub_spot(spots)   # over the projects alone
+        self.resource_layout(spots)
+        return spots, labels, hub
+
+    # The resource section, under the projects: every type from left to right in the order of the game (see resource_order) - an
+    # opened one with its nodes standing to its right, its "New node" card last
+    def resource_layout(self, spots):
+        items = self.resource_items
+        top = HOME_PROJECT_HEIGHT + RESOURCE_SECTION_GAP
+        y = top
+        x = 0.0
+        label = items.get(("label",))
+        if label is not None:
+            spots[label] = QPointF(-label.rect().width() - HOME_PAGE_LABEL_GAP, y)   # before the first type
+        for item in RESOURCES["types"]:
+            keys = [("type", item.full_name)]
+            if item in RESOURCES["expanded"]:
+                keys += [("node", id(node)) for node in resource_nodes_of(item)] + [("node_ghost", item.full_name)]
+            for key in keys:
+                card = items.get(key)
+                if card is not None:
+                    spots[card] = QPointF(x, y)
+                    x += card.rect().width() + RESOURCE_NODE_GAP
+            if item in RESOURCES["expanded"]:
+                # its strip, gone out to the right end of its frame - and the
+                # next type clear of that frame
+                x += RESOURCE_STRIP_WIDTH + RESOURCE_TYPE_GAP
+            else:
+                x += RESOURCE_TYPE_GAP - RESOURCE_NODE_GAP   # the next type clear of this one
 
     # Where the power node stands: centered over every card and HOME_HUB_GAP
     # clear of the highest, the way a project's rides over its machines (see
     # power_layout). Read off where the cards are going rather than where
     # they are, so it glides straight to its place alongside them.
-    # the cog's spot: the middle of everything as it is laid out, and as big
-    # as half the hub's shorter side, the way it used to stand on the screen
+    # the cog's spot: right under the power node, and halfway down from the
+    # top of the cards as they are laid out to the bottom of them - the power
+    # node over them left out - across most of that height
     def place_cog(self, spots, hub):
-        area = QRectF(hub, QSizeF(POWER_NODE_WIDTH, POWER_NODE_HEIGHT))
+        area = QRectF()
         for item, spot in spots.items():
             area = area.united(QRectF(spot, item.rect().size()))
-        radius = max(HOME_HUB_COG_RADIUS, min(area.width(), area.height()) * HOME_COG_SIZE / 2)
-        self.view.cog = (area.center(), radius)
+        if area.isEmpty():
+            area = QRectF(hub, QSizeF(POWER_NODE_WIDTH, POWER_NODE_HEIGHT))
+        radius = max(HOME_HUB_COG_RADIUS, area.height() * HOME_HUB_COG_SIZE / 2)
+        self.view.cog = (QPointF(hub.x() + POWER_NODE_WIDTH / 2, area.center().y()), radius)
         self.view.invalidate_frame()
 
     def hub_spot(self, spots):
@@ -16085,7 +18641,19 @@ class HomePage(QWidget):
         left = min(spot.x() for _, spot in standing)
         right = max(spot.x() + card.rect().width() for card, spot in standing)
         top = min(spot.y() for _, spot in standing)
-        return QPointF((left + right - POWER_NODE_WIDTH) / 2, top - HOME_HUB_GAP - POWER_NODE_HEIGHT)
+        # Lifted higher when its lines need more lanes than HOME_HUB_GAP holds
+        # at their full spacing (see power_lanes): one a line, on whichever
+        # side of it has the most - so they never have to close up
+        middle = (left + right) / 2
+        sides = [0, 0]
+        for card, spot in standing:
+            summary = getattr(card, "summary", None)
+            if summary is None or getattr(card, "off", False) or not (summary["made"] or summary["drawn"]):
+                continue
+            sides[spot.x() + card.rect().width() / 2 >= middle] += 1
+        needed = POWER_RAIL_GAP + (max(sides) - 1) * POWER_LANE_STEP + POWER_LANE_ROOM if max(sides) else 0
+        gap = max(HOME_HUB_GAP, needed)
+        return QPointF((left + right - POWER_NODE_WIDTH) / 2, top - gap - POWER_NODE_HEIGHT)
 
     def stop_slide(self):
         if self.slide is not None:
@@ -16115,6 +18683,7 @@ class HomePage(QWidget):
                 self.hub.setPos(hub_from + (hub - hub_from) * progress)
                 self.hub.node.coordinate = (self.hub.pos().x(), self.hub.pos().y())
             self.route_power()
+            self.route_resources()
 
         self.slide = animate_value(self, 0.0, 1.0, step, HOME_SLIDE_MS)
         self.slide.finished.connect(lambda: setattr(self, "slide", None))
@@ -16130,8 +18699,8 @@ class HomePage(QWidget):
     # every card, page label and the power node gliding to where `rows` puts
     # them
     def glide_to(self, rows):
-        spots, labels, hub, _ = self.layout(rows)
-        # each page's label beside its first line, wherever that has gone
+        spots, labels, hub = self.layout(rows)
+        # each page's label before its first card, wherever that has gone
         for label, spot in zip(self.labels, labels):
             spots[label] = spot
         self.slide_to(spots, hub)
@@ -16139,8 +18708,8 @@ class HomePage(QWidget):
     # ---- putting the projects in another order ----
     #
     # A card taken by the mouse follows it, and the others slide aside to show
-    # where it would go: the nearest place in the nearest row, pages
-    # included. The tab row follows as it goes, its tabs sliding to the order
+    # where it would go: the nearest place along the line, on whichever page
+    # that is. The tab row follows as it goes, its tabs sliding to the order
     # the cards stand in; set down, the card glides from where it was dropped
     # into its place.
     def card_drag(self, card, point, phase):
@@ -16154,29 +18723,23 @@ class HomePage(QWidget):
             return
         if phase in ("start", "move"):
             rows = drag["rows"]
-            # the line under the card, read off the hub as it stands now -
-            # the card's own place in it included - and the spot along it
-            current = drag["order"] or self.rows()
-            lines = self.layout(current)[3]
-            middle = card.sceneBoundingRect().center()
-            line = min(max(round((middle.y() - HOME_CARD_HEIGHT / 2) / HOME_CARD_PITCH_Y), 0), len(lines) - 1)
-            row, start = lines[line]
-            # the other cards on that line, and the places the card could
-            # take among them: before the first, between two, after the last.
-            # It takes the one its middle is nearest - read off the line
-            # without it, so the room it makes does not move what it is
-            # measured against.
-            page_list = current[row][1]
-            on_line = [page for page in page_list[start:start + HOME_CARDS_PER_LINE] if page is not card.page]
-            before = start - (1 if card.page in page_list[:start] else 0)
+            # Every place the card could take - before the first card of a
+            # page, between two, after its last - laid out as the line would
+            # stand with it there, and the one whose spot for it lies nearest
+            # its middle taken. Measured on the line as it would be, so the
+            # room the card makes does not move what it is measured against.
+            middle = card.sceneBoundingRect().center().x()
             width = card.rect().width()
-            places, x = [], 0.0
-            for page in on_line + [None]:
-                places.append(abs(x + width / 2 - middle.x()))
-                other = self.cards.get(page)
-                x += (other.rect().width() if other is not None else HOME_CARD_WIDTH) + HOME_CARD_GAP_X
-            along = min(range(len(places)), key=places.__getitem__)
-            column = min(before + along, len(rows[row][1]))
+            best, nearest = None, None
+            for row, (m, pages) in enumerate(rows):
+                for column in range(len(pages) + 1):
+                    order = [(n, list(p)) for n, p in rows]
+                    order[row][1].insert(column, card.page)
+                    spot = self.layout(order)[0][card]
+                    distance = abs(spot.x() + width / 2 - middle)
+                    if nearest is None or distance < nearest:
+                        best, nearest = (row, column), distance
+            row, column = best
             if (row, column) != drag["at"]:
                 drag["at"] = (row, column)
                 order = [(m, list(pages)) for m, pages in rows]
@@ -16191,6 +18754,7 @@ class HomePage(QWidget):
                     drag["moved"] = True
                     self.tabs.reorder_projects(wanted)
             self.route_power()
+            self.route_resources()
             return
         # dropped
         self.drag = None
@@ -16213,16 +18777,20 @@ class HomePage(QWidget):
         was = {page: card.pos() for page, card in self.cards.items()}
         ghost_was = self.ghost.pos() if self.ghost is not None else None
         hub_was = self.hub.pos() if self.hub is not None else None
+        resource_was = {key: card.pos() for key, card in self.resource_items.items()}
+        framed_was = set(self.resource_frames)   # the types already opened: a new frame fades in
         self.stop_slide()
         scene = self.view.scene()
-        for card in list(self.cards.values()) + [self.ghost]:
-            if card is not None and card.hover_fade is not None:
+        for card in list(self.cards.values()) + [self.ghost] + list(self.resource_items.values()):
+            if card is not None and getattr(card, "hover_fade", None) is not None:
                 try:
                     card.hover_fade.stop()
                 except RuntimeError:
                     pass
         scene.clear()
         self.cards, self.power_lines, self.ghost, self.hub, self.labels = {}, [], None, None, []
+        self.resource_items, self.resource_lines, self.resource_frames = {}, [], {}
+        self.resource_leaving = {}
         rows = self.rows()
         last = getattr(self.window(), "last_project", None)
         made = drawn = 0.0
@@ -16239,7 +18807,8 @@ class HomePage(QWidget):
                     drawn += max(-net, 0.0)
                 card = ProjectCardItem(page, summary, lambda page=page: self.open_project(page),
                                        lambda at, page=page: self.project_menu(page, at),
-                                       lambda page=page: self.switch_project(page), last=page is last)
+                                       lambda page=page: self.switch_project(page), last=page is last,
+                                       on_complete=lambda page=page: self.complete_project(page))
                 card.on_drag = self.card_drag
                 scene.addItem(card)
                 self.cards[page] = card
@@ -16248,7 +18817,8 @@ class HomePage(QWidget):
 
         self.ghost = NewProjectCardItem(self.add_project)
         scene.addItem(self.ghost)
-        spots, labels, hub_spot, _ = self.layout(rows)
+        self.make_resources()
+        spots, labels, hub_spot = self.layout(rows)
         self.place_cog(spots, hub_spot)
         for number, spot in enumerate(labels):
             label = PageLabelItem(number + 1)
@@ -16258,6 +18828,30 @@ class HomePage(QWidget):
         for page, card in self.cards.items():
             card.setPos(was.get(page, spots[card]))
         self.ghost.setPos(ghost_was if ghost_was is not None else spots[self.ghost])
+        # a resource card put back where it stood; a node shown for the first
+        # time comes out of its type's card, and anything new fades in
+        for key, card in self.resource_items.items():
+            if key in resource_was:
+                card.setPos(resource_was[key])
+                continue
+            start_at = spots[card]
+            if key[0] in ("node", "node_ghost"):
+                # tucked in behind its type's card, against its right side,
+                # to slide out from under it
+                owner = ("type", card.node.item.full_name if key[0] == "node" else key[1])
+                type_card = self.resource_items.get(owner)
+                corner = resource_was.get(owner, spots.get(type_card, start_at))
+                if type_card is not None:
+                    corner = corner + QPointF(tucked_under(type_card, card), 0)
+                start_at = corner
+            card.setPos(start_at)
+            if resource_was:
+                arriving.append(card)
+        # a type just opened: its frame grows out of the card's own outline,
+        # stretching round its nodes as they slide out
+        for item, frame in self.resource_frames.items():
+            if resource_was and item not in framed_was:
+                self.stretch_frame(frame, 0.0, 1.0)
 
         start = hub_was if hub_was is not None else hub_spot
         self.hub = PowerNodeItem(HubPower(made, drawn, (start.x(), start.y())), lambda node, item: self.pick_power())
@@ -16266,9 +18860,308 @@ class HomePage(QWidget):
         scene.text_items = list(self.hub.texts)
         self.wire_power()
         self.show_power()
+        self.wire_resources()
         self.slide_to(spots, hub_spot)
+        self.route_resources()
         for card in arriving:
             self.fade_in_card(card)
+
+    # ---- the resource nodes ----
+
+    # every card of the resource section, made from RESOURCES and what the
+    # projects just read take of each type. Keyed so a card made again for
+    # the same thing is known as the one that stood there before.
+    def make_resources(self):
+        scene = self.view.scene()
+        items = self.resource_items
+        # a project switched off on the hub takes nothing from the nodes
+        demands = [(page, card.summary.get("extracted", {}), card.summary.get("pumped", 0.0))
+                   for page, card in self.cards.items() if not page.hub_off]
+        self.resource_shares = shares = allocate_resources(demands)
+        type_width = resource_type_width(shares)
+        items[("label",)] = ResourceLabelItem()
+        for item in RESOURCES["types"]:
+            nodes = resource_nodes_of(item)
+            items[("type", item.full_name)] = ResourceTypeCardItem(
+                item, shares[item], len(nodes), lambda item=item: self.toggle_resource(item),
+                lambda at, item=item: self.resource_type_menu(item, at), type_width)
+            if item not in RESOURCES["expanded"]:
+                continue
+            ghost = items[("node_ghost", item.full_name)] = NewProjectCardItem(
+                lambda item=item: self.add_resource_node(item), "New node", RESOURCE_NEW_NODE_WIDTH,
+                f"Add a {resource_name(item)} node", HOME_CARD_HEIGHT)
+            ghost.setZValue(0.8)   # over its type's ground, under its type's card
+            for number, node in enumerate(nodes, 1):
+                used = sum(shares[item]["nodes"][node].values())
+                if node is FREE_WATER:
+                    feeds = [page.project_name for page in shares[item]["nodes"][node]]
+                    items[("node", id(node))] = FreeWaterCardItem(node, used, feeds)
+                    continue
+                feeds = [page.project_name for page in self.cards if page.uid in node.links]
+                items[("node", id(node))] = ResourceNodeCardItem(
+                    node, number, used, feeds,
+                    lambda what, at, node=node: self.resource_node_menu(node, what, at),
+                    lambda node=node: self.remove_resource_node(node))
+        for card in items.values():
+            scene.addItem(card)
+        for item in RESOURCES["types"]:
+            if item in RESOURCES["expanded"]:
+                frame = self.resource_frames[item] = ResourceFrameItem(item)
+                scene.addItem(frame)
+                scene.addItem(frame.ground)
+
+    # A line from every project to what it takes from: the type, shut - or,
+    # opened, each of its nodes feeding that project
+    def wire_resources(self):
+        scene = self.view.scene()
+        items = self.resource_items
+        for item in RESOURCES["types"]:
+            share = self.resource_shares.get(item)
+            if share is None:
+                continue
+            if item in RESOURCES["expanded"]:
+                feeds = [(items.get(("node", id(node))), page, rate)
+                         for node in resource_nodes_of(item) for page, rate in share["nodes"][node].items()]
+            else:
+                feeds = [(items.get(("type", item.full_name)), page, rate)
+                         for page, rate in share["projects"].items()]
+            for source, page, rate in feeds:
+                project = self.cards.get(page)
+                if source is None or project is None:
+                    continue
+                line = ResourceLineItem(item, rate, project, source)
+                scene.addItem(line)
+                self.resource_lines.append(line)
+        # every node card picks itself out on a click
+        for key, card in items.items():
+            if key[0] == "node":
+                card.on_click = lambda node=card.node: self.pick_resource(node)
+                card.setCursor(Qt.PointingHandCursor)
+        self.show_picked()
+
+    # A node clicked on: its lines up to the projects it feeds brought up
+    # and the rest stepping back - and a click on it again puts them all back
+    def pick_resource(self, node):
+        self.picked_resource = None if self.picked_resource is node else node
+        self.show_picked()
+
+    # nothing lit while the picked node is out of sight: its type folded, or
+    # the node gone
+    def show_picked(self):
+        card = self.resource_items.get(("node", id(self.picked_resource)))
+        if card is None:
+            self.picked_resource = None
+        for key, other in self.resource_items.items():
+            if key[0] == "node" and other.picked != (other is card):
+                other.picked = other is card
+                other.update()
+        for line in self.resource_lines:
+            line.set_lit(None if card is None else line.source is card)
+
+    # Every resource line laid again: out of its project's arrow for what it
+    # carries, and into the top of its card, spread in the order of where
+    # they come down from
+    def route_resources(self):
+        # each opened type's frame round its card and its nodes' as they stand -
+        # and its strip, out at the right end of them all, hugging the frame's
+        # right side as it stretches and shrinks
+        for item, frame in self.resource_frames.items():
+            box = QRectF()
+            type_card = self.resource_items.get(("type", item.full_name))
+
+            # A node card wider than its type's sticks out past it, tucked
+            # in under it: the frame holds only as much of that as it has
+            # grown out by, so it shrinks back onto the type's own outline
+            # rather than round what is left sticking out
+            def held(card):
+                rect = card.sceneBoundingRect()
+                if type_card is not None and card is not type_card:
+                    over = rect.width() - type_card.rect().width()
+                    if over > 0:
+                        rect.setWidth(rect.width() - over * (1.0 - frame.level))
+                return rect
+
+            for key, card in self.resource_items.items():
+                if key == ("type", item.full_name) or key == ("node_ghost", item.full_name) or (
+                        key[0] == "node" and card.node.item is item):
+                    box = box.united(held(card))
+            for card in self.resource_leaving.get(item, ()):   # folding back into it: held all the way
+                box = box.united(held(card))
+            if type_card is not None and not box.isEmpty():
+                own = type_card.sceneBoundingRect()
+                past = box.right() - own.right()   # how far its nodes reach past its card
+                out = past + (RESOURCE_NODE_GAP + RESOURCE_STRIP_WIDTH) * min(1.0, past / RESOURCE_STRIP_WIDTH)
+                type_card.strip.setPos(max(0.0, out), 0)
+                # out at the frame's end it runs its whole height; still in
+                # the card, the card's own
+                type_card.strip.set_height(box.bottom() - own.top() if out > 0.5 else own.height())
+                box = box.united(type_card.strip.sceneBoundingRect())
+            pad = RESOURCE_FRAME_PAD * frame.level
+            frame.set_box(box.adjusted(-pad, -pad, pad, pad) if not box.isEmpty() else box)
+        bottoms = {}
+        ends = {}
+        for line in self.resource_lines:
+            bottoms.setdefault(line.source, []).append(line)
+            ends[line] = [line.project.input_port(line.item), None]
+        for card, lines in bottoms.items():
+            lines.sort(key=lambda line: ends[line][0].x())
+            width = card.rect().width()
+            # out of the top of its card - or, for a node in an opened type,
+            # out of the top of the frame round it
+            frame = self.resource_frames.get(card.node.item) if hasattr(card, "node") else None
+            edge = frame.box.top() if frame is not None and not frame.box.isEmpty() else card.pos().y()
+            for index, line in enumerate(lines):
+                ends[line][1] = QPointF(card.pos().x() + width * (index + 1) / (len(lines) + 1), edge)
+        for line, (top, bottom) in ends.items():
+            line.set_ends(top, bottom)
+
+    # a type's nodes shown to its right, or folded back into it: they glide
+    # into its card as they fade, the rest closing up after them
+    def toggle_resource(self, item):
+        if item not in RESOURCES["expanded"]:
+            RESOURCES["expanded"].add(item)
+            schedule_save()
+            self.refresh()
+            return
+        RESOURCES["expanded"].discard(item)
+        schedule_save()
+        leaving = {key: card for key, card in self.resource_items.items()
+                   if (key[0] == "node" and card.node.item is item) or key == ("node_ghost", item.full_name)}
+        for key in leaving:
+            del self.resource_items[key]
+        spots, labels, hub = self.layout(self.rows())
+        for label, spot in zip(self.labels, labels):
+            spots[label] = spot
+        into = spots.get(self.resource_items.get(("type", item.full_name)))
+        self.slide_to(spots, hub)
+        if not leaving or into is None:
+            self.refresh()
+            return
+        # each slides back in under the type's card (see tucked_under)
+        type_card = self.resource_items[("type", item.full_name)]
+        starts = [(card, card.pos(), into + QPointF(tucked_under(type_card, card), 0))
+                  for card in leaving.values()]
+        # its frame shrinks round them as they go, back onto the card's own outline
+        self.resource_leaving[item] = list(leaving.values())
+        frame = self.resource_frames.get(item)
+
+        def step(progress):
+            progress = float(progress)
+            try:
+                for card, start, end in starts:
+                    card.setPos(start + (end - start) * progress)
+                    card.setOpacity(1.0 - progress)
+                if frame is not None:
+                    frame.level = 1.0 - progress
+            except RuntimeError:
+                return   # the hub was built again meanwhile
+            self.route_resources()
+
+        fold = animate_value(self, 0.0, 1.0, step, HOME_SLIDE_MS)
+        fold.finished.connect(self.refresh)
+
+    # a frame standing out from its cards by `start` of its pad, eased to `end`
+    def stretch_frame(self, frame, start, end):
+        frame.level = start
+
+        def step(value):
+            try:
+                frame.level = float(value)
+            except RuntimeError:
+                return   # the hub was built again meanwhile
+            self.route_resources()
+
+        animate_value(self, start, end, step, HOME_SLIDE_MS)
+
+    # the hub's menus, all in the one look
+    def hub_menu(self):
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu {"
+            f"  background: {MENU_BG}; color: {TEXT_NORMAL};"
+            f"  border: 1px solid {OUTPUT_FIELD_BORDER}; border-radius: {HOVER_BORDER_RADIUS}px;"
+            f"  padding: 4px; font-size: {HOME_LABEL_SIZE + 1}px;"
+            "}"
+            "QMenu::item { padding: 6px 22px 6px 14px; border-radius: 3px; }"
+            f"QMenu::item:selected {{ background: {CANCEL_BUTTON_BG}; color: {TEXT_STRONG}; }}"
+            f"QMenu::separator {{ height: 1px; background: {OUTPUT_FIELD_BORDER}; margin: 4px 6px; }}"
+        )
+        return menu
+
+    def resources_changed(self):
+        schedule_save()
+        # a project opened stands its extraction boxes on its nodes again
+        for page in self.project_pages():
+            changed = getattr(page.view, "on_sites_changed", None) if page.loaded() else None
+            if changed is not None:
+                changed()
+        self.refresh()
+
+    def add_resource_node(self, item):
+        RESOURCES["nodes"].append(ResourceNode(item))
+        self.resources_changed()
+
+    def resource_type_menu(self, item, at):
+        menu = self.hub_menu()
+        opened = item in RESOURCES["expanded"]
+        menu.addAction("Fold its nodes back" if opened else "Show its nodes", lambda: self.toggle_resource(item))
+        menu.addAction("Add a node", lambda: self.add_resource_node(item))
+        menu.exec(at)
+
+    # What one value of a node can be changed to, dropped at `at`: its
+    # purity, the extractor on it, or the projects it feeds - every one taking
+    # its resource, and any it feeds already, ticked, a click linking or
+    # unlinking it
+    def resource_node_menu(self, node, what, at):
+        menu = self.hub_menu()
+        if what == "purity":
+            for purity in RESOURCE_PURITIES:
+                action = menu.addAction(purity.capitalize(), lambda purity=purity: self.set_node_purity(node, purity))
+                action.setCheckable(True)
+                action.setChecked(node.purity == purity)
+        elif what == "shards":
+            for shards in range(RESOURCE_SHARDS_MAX + 1):
+                words = (f"{round(shard_clock(shards) * 100)}% - "
+                         + (f"{shards} power shard{'' if shards == 1 else 's'}" if shards else "no shard"))
+                action = menu.addAction(words, lambda shards=shards: self.set_node_shards(node, shards))
+                action.setCheckable(True)
+                action.setChecked(node.shards == shards)
+        elif what == "extractor":
+            for machine in resource_extractors(node.item):
+                action = menu.addAction(machine.display_name,
+                                        lambda machine=machine: self.set_node_extractor(node, machine))
+                action.setCheckable(True)
+                action.setChecked(node.extractor is machine)
+        else:
+            takers = [page for page, card in self.cards.items()
+                      if card.summary.get("extracted", {}).get(node.item, 0) > 0 or page.uid in node.links]
+            for page in takers:
+                action = menu.addAction(page.project_name, lambda page=page: self.toggle_node_link(node, page))
+                action.setCheckable(True)
+                action.setChecked(page.uid in node.links)
+            if not takers:
+                menu.addAction(f"No project takes {resource_name(node.item)}").setEnabled(False)
+        menu.exec(at)
+
+    def toggle_node_link(self, node, page):
+        node.links.symmetric_difference_update({page.uid})
+        self.resources_changed()
+
+    def set_node_shards(self, node, shards):
+        node.shards = shards
+        self.resources_changed()
+
+    def set_node_purity(self, node, purity):
+        node.purity = purity
+        self.resources_changed()
+
+    def set_node_extractor(self, node, machine):
+        node.extractor = machine
+        self.resources_changed()
+
+    def remove_resource_node(self, node):
+        RESOURCES["nodes"] = [other for other in RESOURCES["nodes"] if other is not node]
+        self.resources_changed()
 
     # a project just made comes in on its spot rather than popping up there
     def fade_in_card(self, card):
@@ -16311,50 +19204,33 @@ class HomePage(QWidget):
         for line in self.power_lines:
             line.set_live(self.lines_live)
 
-    # every line laid again: up out of its card to a rail a block over the
-    # highest card, then across to the hub
+    # Every line laid again: up out of its card to a lane of its own, then
+    # across to under the hub and up into it. On each side of the hub the
+    # nearest card's line takes the lowest lane, a block over the cards, and
+    # each one further out the lane over that - so they nest, the outer ones
+    # running over the inner ones without ever crossing or running together.
+    # The lanes close up when there are more of them than the room under the
+    # hub holds.
     def route_power(self):
         wired = [card for card in self.cards.values() if card.power_line is not None]
         if not wired or self.hub is None:
             return
-        rail = min(card.pos().y() for card in wired) - POWER_RAIL_GAP
-        boxes = [(card, card.sceneBoundingRect()) for card in self.cards.values()]
-        if self.ghost is not None:
-            boxes.append((self.ghost, self.ghost.sceneBoundingRect()))
+        # the rail over the row as it stands, not over a card carried about by
+        # hand: every other line would rise and fall with it as it went
+        held = self.drag["card"] if self.drag is not None else None
+        resting = [card for card in wired if card is not held] or wired
+        rail = min(card.pos().y() for card in resting) - POWER_RAIL_GAP
+        tops = {card: QPointF(card.pos().x() + power_arrow_x(card.feeding, card.rect().width()), card.pos().y())
+                for card in wired}
+        ends = {card: self.hub.feed_point(card.feeding) for card in wired}
+        lanes = power_lanes({card: (tops[card], ends[card]) for card in wired}, rail,
+                            self.hub.pos().y() + POWER_NODE_HEIGHT)
+        # Always on its lane: the cards stand on the one row, so nothing is
+        # ever in the way of a line's climb - but a card carried over another
+        # one used to read as standing in it, and that line was bent off
+        # round it while the drag went on.
         for card in wired:
-            top = QPointF(card.pos().x() + power_arrow_x(card.feeding, card.rect().width()), card.pos().y())
-            climb = QRectF(top.x() - 1, rail, 2, max(top.y() - rail, 0))
-            gutter = None
-            if any(other is not card and rect.intersects(climb) for other, rect in boxes):
-                gutter = self.clear_gutter(card, boxes, rail)
-            card.power_line.set_route(top, rail, self.hub.feed_point(card.feeding), gutter)
-
-    # Where a line steps aside to, to climb from `card` up to the rail: the
-    # gap beside it on the side facing the hub, so it climbs inside the rows
-    # rather than out past their ends - if that gap runs clear all the way up.
-    # Cards widened for their outputs leave the lines over it unaligned, so
-    # failing that it is the middle of the nearest gap that does.
-    def clear_gutter(self, card, boxes, rail):
-        own = card.sceneBoundingRect()
-        half = HOME_CARD_GAP_X / 2
-        toward = own.center().x() < self.hub.center().x()
-        wanted = own.right() + half if toward else own.left() - half
-        # what stands over the card, up to the rail, as stretches across
-        blocked = []
-        for left, right in sorted((rect.left(), rect.right()) for other, rect in boxes
-                                  if other is not card and rect.top() < own.top() and rect.bottom() > rail):
-            if blocked and left <= blocked[-1][1]:
-                blocked[-1][1] = max(blocked[-1][1], right)
-            else:
-                blocked.append([left, right])
-        clearance = GRID_SQUARE / 2
-        if all(wanted < left - clearance or wanted > right + clearance for left, right in blocked):
-            return wanted
-        # the middle of every gap between them, and just past either end
-        places = [blocked[0][0] - half, blocked[-1][1] + half]
-        places += [(right + left) / 2 for (_, right), (left, _) in zip(blocked, blocked[1:])
-                   if left - right >= 2 * clearance]
-        return min(places, key=lambda x: abs(x - wanted))
+            card.power_line.set_lane(tops[card], lanes[card], ends[card])
 
     def show_power(self):
         shown = panel_options["home_show_power"]
@@ -16371,11 +19247,77 @@ class HomePage(QWidget):
         for line in self.power_lines:
             line.set_live(self.lines_live)
 
+    # Every box of a project ticked off as built, or none of them - from its
+    # card, opened or not: an open one's own map does it (its Complete
+    # button), one not opened yet has it written into what it was saved with
+    def complete_project(self, page):
+        view = getattr(page, "view", None) if page.loaded() else None
+        if view is not None and getattr(view, "set_all_done", None) is not None:
+            view.set_all_done(not view.all_done())
+        else:
+            nodes = unloaded_tree(page) or []
+            keys = {node_key(node) for node in nodes if isinstance(node, Recipe_Node) and node.merged_into is None}
+            saved = page.saved if page.saved is not None else {}
+            done = set(saved.get("built_nodes") or ())
+            if keys and keys <= done:
+                done -= keys
+            else:
+                done |= keys
+            saved["built_nodes"] = sorted(done)
+            page.saved = saved
+        schedule_save()
+        self.refresh()
+
     # a project in or out of the hub's power, its card faded while it is out
+    # Flipped: its switch slides over and the card fades to its new strength,
+    # its power line fading out of the grid with it - or back in - while the
+    # hub's total and the other lines take the change at once
     def switch_project(self, page):
+        old = self.cards.get(page)
+        line = old.power_line if old is not None else None
+        going = (QPainterPath(line.path()), QPen(line.pen()), line.zValue()) if line is not None and line.isVisible() else None
         page.hub_off = not page.hub_off
         schedule_save()
         self.refresh()
+        card = self.cards.get(page)
+        if card is None:
+            return
+        off = page.hub_off
+        start, end = (1.0, HOME_CARD_OFF_OPACITY) if off else (HOME_CARD_OFF_OPACITY, 1.0)
+        card.setOpacity(start)
+        card.switch_button.knob = 1.0 if off else 0.0
+        coming = card.power_line if not off else None
+        if coming is not None:
+            coming.setOpacity(0.0)
+        leaving = None
+        if off and going is not None:
+            # the line it had, drawn on a moment longer to fade out
+            leaving = QGraphicsPathItem(going[0])
+            leaving.setPen(going[1])
+            leaving.setZValue(going[2])
+            self.view.scene().addItem(leaving)
+
+        def step(t):
+            t = float(t)
+            try:
+                card.setOpacity(start + (end - start) * t)
+                card.switch_button.knob = (1.0 - t) if off else t
+                card.switch_button.update()
+                if coming is not None:
+                    coming.setOpacity(t)
+                if leaving is not None:
+                    leaving.setOpacity(1.0 - t)
+            except RuntimeError:
+                pass   # the hub was built again meanwhile
+
+        def done():
+            try:
+                if leaving is not None and leaving.scene() is not None:
+                    leaving.scene().removeItem(leaving)
+            except RuntimeError:
+                pass
+
+        animate_value(self, 0.0, 1.0, step, HOME_SWITCH_MS).finished.connect(done)
 
     def open_project(self, page):
         if self.tabs is not None and self.tabs.indexOf(page) != -1:
@@ -16387,17 +19329,7 @@ class HomePage(QWidget):
     def project_menu(self, page, at):
         if self.tabs is None or self.tabs.indexOf(page) == -1:
             return
-        menu = QMenu(self)
-        menu.setStyleSheet(
-            "QMenu {"
-            f"  background: {MENU_BG}; color: {TEXT_NORMAL};"
-            f"  border: 1px solid {OUTPUT_FIELD_BORDER}; border-radius: {HOVER_BORDER_RADIUS}px;"
-            f"  padding: 4px; font-size: {HOME_LABEL_SIZE + 1}px;"
-            "}"
-            "QMenu::item { padding: 6px 22px 6px 14px; border-radius: 3px; }"
-            f"QMenu::item:selected {{ background: {CANCEL_BUTTON_BG}; color: {TEXT_STRONG}; }}"
-            f"QMenu::separator {{ height: 1px; background: {OUTPUT_FIELD_BORDER}; margin: 4px 6px; }}"
-        )
+        menu = self.hub_menu()
         menu.addAction("Open", lambda: self.open_project(page))
         menu.addSeparator()
         menu.addAction("Rename...", lambda: self.edit_project(page))
@@ -16526,7 +19458,7 @@ def make_canvas():
         # the info panel the manager is bolted to, as it stood: a rebuild
         # draws the map again, and the panel goes with the old one
         opened_on = getattr(graphics_view, "info_node", lambda: None)()
-        spot = graphics_view.info_panel.pos() if opened_on is not None and graphics_view.info_was_dragged() else None
+        spot = graphics_view.info_spot() if opened_on is not None and graphics_view.info_was_dragged() else None
         rebuild_around(anchor, lambda: Node.resplit(
             built, item, split, panel_options["recipe_choices"], panel_options["node_recipe_choices"]))
         # ...opened again where it was, on the same box - or, gone, on another
@@ -16569,6 +19501,23 @@ def make_canvas():
             home.refresh_soon()   # its card's power, and the grid's
 
     graphics_view.on_pumps_changed = pumps_changed
+
+    # the resource nodes it has changed: its extraction boxes stood on them again
+    def sites_changed():
+        steps = getattr(graphics_view, "build_steps", None)
+        if steps:
+            # the info panel standing open - a source's node manager, say -
+            # opened again where it was on the map drawn again
+            opened_on = getattr(graphics_view, "info_node", lambda: None)()
+            spot = (graphics_view.info_spot() if opened_on is not None and graphics_view.info_was_dragged()
+                    else None)
+            restand_extractions(getattr(graphics_view, "project_page", None), steps)
+            apply_extra(steps, project_extra(steps))
+            redraw_graph()
+            if opened_on is not None and graphics_view.build_step == len(steps) - 1:
+                graphics_view.open_node_info(opened_on, spot)
+
+    graphics_view.on_sites_changed = sites_changed
 
     recipe_manager = make_recipe_manager(graphics_view)
     recipe_manager.on_apply = resplit_item
@@ -16633,7 +19582,7 @@ def make_canvas():
         built = graphics_view.build_steps[-1]["nodes"]
         match_compact()   # what stays and what is new, laid out at one spacing
         kept = {n: n.coordinate for n in built}
-        set_miner_mark(panel_options["miners_mark"])
+        prepare_build(getattr(graphics_view, "project_page", None))
         steps = make_steps()
         apply_extra(steps, project_extra(steps))   # a pump on a line gone is drawn no more
         layout_nodes(steps, kept, anchor)
@@ -16668,7 +19617,7 @@ def make_canvas():
             return confirm_fresh()
         match_compact()   # the spots read and put back at one spacing
         spots = node_positions(steps[-1]["nodes"])
-        set_miner_mark(panel_options["miners_mark"])
+        prepare_build(getattr(graphics_view, "project_page", None))
         steps = Node.get_nodes_from_outputs(panel_options["output"], panel_options["recipe_choices"],
                                             panel_options["node_recipe_choices"],
                                             consumers=side[0].consumer_draw())
@@ -16686,7 +19635,6 @@ def make_canvas():
         vertical.setValue(offset_y)
         graphics_view.notify_view_changed()
         report(steps[-1]["nodes"])
-        match_panel_order()
         if step_bar[0] is not None:
             step_bar[0].refresh()
         schedule_save()
@@ -16703,39 +19651,8 @@ def make_canvas():
             panel_options["node_recipe_choices"].clear()
         confirm_fresh()
 
-    # The panel's cards in the order the tree shows them: top to bottom, as
-    # the boxes they ask for stand on the map. An output's card goes by its
-    # output's box, and two cards of one item - one output box - by the boxes
-    # running their recipes; with the outputs drawn as outlines, by the boxes
-    # running their recipes first, those being what is on the map. A
-    # generator's card goes by the generator's box.
-    # Run when the build button builds, and only then: boxes dragged about
-    # afterwards, the outputs switched to outlines or a node's recipe picked
-    # leave the cards where they are - and so does a saved project being
-    # built again as it is opened (held, see hold_panel_order).
-    panel_order_held = [False]
-
-    def match_panel_order():
-        steps = getattr(graphics_view, "build_steps", None)
-        if not steps or side[0] is None or panel_order_held[0]:
-            return
-        nodes = steps[-1]["nodes"]
-        outputs = {node.item: node for node in nodes if isinstance(node, Output_Node) and not node.is_byproduct}
-        runs = {node.recipe: node for node in nodes
-                if isinstance(node, Recipe_Node) and node.merged_into is None}
-        nowhere = (float("inf"), float("inf"))
-
-        def at(node):
-            return (node.coordinate[1], node.coordinate[0]) if node is not None else nowhere
-
-        def rank(item, recipe):
-            run = at(runs.get(recipe))
-            if item is POWER_ITEM:
-                return run
-            made = at(outputs.get(item))
-            return run + made if panel_options["hide_outputs"] else made + run
-
-        side[0].sort_cards(rank)
+    # The panel's cards stay in the order they were put in: only the player
+    # moves them, never a build - generated, regenerated or updated.
 
     def confirm_fresh():
         reveal = panel_options["build_reveal"]
@@ -16755,7 +19672,6 @@ def make_canvas():
         transition_scene(graphics_view, scene)
         fit_view_to_rect(graphics_view, build_steps_bounds(graphics_view.build_steps), animate=True)
         report(graphics_view.build_steps[-1]["nodes"])   # what the finished factory costs
-        match_panel_order()
         if step_bar[0] is not None:
             step_bar[0].refresh()
             if reveal == "play":
@@ -16987,6 +19903,7 @@ def make_canvas():
     # top to bottom, with full screen at the foot of the bar, in the corner
     # where it has always been
     toolbar = add_view_toolbar(graphics_view)
+    complete_button = add_complete_button(graphics_view, toolbar)
     compact_button = toolbar.add_toggle(
         lambda: f"size_{'compact' if panel_options['compact'] else 'detail'}",
         lambda: NODE_SIZE_LABELS[panel_options["compact"]],
@@ -17084,7 +20001,6 @@ def make_canvas():
             redraw_graph()
 
     container.refresh_grid = refresh_grid
-    container.hold_panel_order = lambda held: panel_order_held.__setitem__(0, held)
     # the panel's own confirm, not the canvas': it reads the cards into
     # panel_options["output"] first, which is what the build actually goes on
     container.build = side_confirm
@@ -17148,6 +20064,9 @@ class ProjectPage(QWidget):
         self.tab_color = (saved or {}).get("color") or TAB_DEFAULT_COLOR
         self.tab_page = (saved or {}).get("tab_page", 0)   # which page of the tab row it is on
         self.hub_off = (saved or {}).get("hub_off", False)   # switched off on the hub: its power left out
+        # who it is for good, whatever it is renamed to: what a resource node
+        # linked to it keeps (see ResourceNode.links)
+        self.uid = (saved or {}).get("uid") or uuid.uuid4().hex
         self.home_cache = None   # its tree as the hub last worked it out, while it is not loaded
         # compact or detailed boxes: this project's own, whatever the others
         # are at. A new one starts detailed; one from a save made before
@@ -17339,14 +20258,10 @@ class ProjectPage(QWidget):
     def rebuild_saved(self, project):
         reveal = panel_options["build_reveal"]
         panel_options["build_reveal"] = "skip"
-        # the cards come back in the order they were saved in: the panel only
-        # follows the tree when the build button is pressed
-        self.canvas.hold_panel_order(True)
         try:
             self.build()
         finally:
             panel_options["build_reveal"] = reveal
-            self.canvas.hold_panel_order(False)
         steps = getattr(self.view, "build_steps", None)
         if not steps:
             return
@@ -17652,6 +20567,7 @@ class MainWindow(QMainWindow):
         # graph is drawn from them
         saved = read_appdata()
         load_options(saved.get("options", {}))
+        load_resources(saved.get("resources"))
         self.resize(*(saved.get("window") or DEFAULT_WINDOW_SIZE))
 
         central = QWidget()
