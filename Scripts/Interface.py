@@ -3870,6 +3870,10 @@ class GridGraphicsView(QGraphicsView):
     def __init__(self, scene, parent=None):
         super().__init__(scene, parent)
         self.zoom = 1.0
+        # the grid kept as a picture, drawn again only once the view is zoomed
+        # or what is under the boxes changes (see invalidate_frame): boxes
+        # sliding over it no longer have it drawn line by line every frame
+        self.setCacheMode(QGraphicsView.CacheBackground)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)  # zoom towards the cursor
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -3945,6 +3949,7 @@ class GridGraphicsView(QGraphicsView):
     # something it draws changed that its items do not know of: drawn afresh
     def invalidate_frame(self):
         self.frame_revision += 1
+        self.resetCachedContent()   # the hub's cog, moved over the grid
         self.viewport().update()
 
     # everything the picture depends on but the view's size
@@ -4269,6 +4274,10 @@ class GridGraphicsView(QGraphicsView):
                 minor_lines.append(line)
             y += step
 
+        # straight lines a pixel wide: antialiasing would only smear them, and
+        # it costs more than all the rest of a frame put together
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, False)
         painter.setPen(QPen(QColor(GRID_LINE_COLOR), 0))   # width 0 : stays 1px when zoomed
         painter.drawLines(minor_lines)
         painter.setPen(QPen(QColor(GRID_SQUARE_COLOR), 0))
@@ -4280,6 +4289,7 @@ class GridGraphicsView(QGraphicsView):
         axis_color.setAlpha(GRID_AXIS_ALPHA)
         painter.setPen(QPen(axis_color, 0))
         painter.drawLines([line for line in (x_axis, y_axis) if line is not None])
+        painter.restore()
 
 def make_graphics_view(view_class=GridGraphicsView):
     scene = QGraphicsScene()
@@ -9406,7 +9416,7 @@ def build_steps_bounds(steps):
             source = getattr(node, "source_node", None)
             if source is not None and wants_source(node):
                 x, y = source.coordinate
-                bounds = bounds.united(QRectF(x, y, source_width(), NODE_HEIGHT))
+                bounds = bounds.united(QRectF(x, y, source_width(source), NODE_HEIGHT))
     return bounds
 
 # renders whichever step the view is parked on. An empty build still gets a
@@ -10160,7 +10170,7 @@ def render_node_graph(view, frame):
         source = getattr(moved.node, "source_node", None)
         box = items_by_node.get(source) if source is not None else None
         if box is not None:
-            box.setPos(*source_spot((moved.pos().x(), moved.pos().y())))
+            box.setPos(*source_spot((moved.pos().x(), moved.pos().y()), source))
 
     def node_moved(moved=None):
         # a transition drops the whole scene while its boxes are still gliding,
@@ -15961,11 +15971,21 @@ def extraction_sites(page):
             sites.setdefault(node.item, []).append((node.extractor, node.wanted(uid), node.base_capacity()))
     return sites
 
+# what of `page`'s nodes its map is drawn from, comparable: a change on the
+# hub that leaves it the same - a node made, or one another project uses -
+# has nothing to draw again
+def sites_key(page):
+    return sorted((item.full_name, [(machine.full_name, round(capacity, 6), round(base, 6))
+                                    for machine, capacity, base in spots])
+                  for item, spots in extraction_sites(page).items())
+
 # what every build of `page`'s tree is made with: the miner the options pick,
 # and the resource nodes it has
 def prepare_build(page):
     set_miner_mark(panel_options["miners_mark"])
     search.set_extraction_sites(extraction_sites(page))
+    if page is not None:
+        page.sites_drawn = sites_key(page)
 
 # a box digging something out of the ground: a recipe taking nothing in
 def is_extraction(node):
@@ -15980,6 +16000,8 @@ def restand_extractions(page, steps):
     if not steps:
         return
     search.set_extraction_sites(extraction_sites(page))
+    if page is not None:
+        page.sites_drawn = sites_key(page)
     final = steps[-1]
     for node in final["nodes"]:
         if is_extraction(node):
@@ -16027,18 +16049,30 @@ def unloaded_tree(page):
 # picks them and shares the box's need out between them. The machines of
 # the box stand on them (see search.EXTRACTION_SITES). Water a Water
 # Extractor pumps comes from the free water, and its box has nothing to pick.
-# a source box: its picture filling the square of two grid squares on its
-# left, its caret the one square at its top right - in from their edges by
+# a source box: its picture, or its +, filling it - in from its edges by
 # this much
 SOURCE_INSET = NODE_INFO_BUTTON_MARGIN
 SOURCE_GAP = GRID_SQUARE * 3            # from its right side to the box it feeds
 
-def source_width():
-    return NODE_HEIGHT + GRID_SQUARE
+# a square of two grid squares: its node's picture, or its big + while the
+# project has no node for it yet
+def source_width(source=None):
+    return NODE_HEIGHT
 
-# where a source node stands for an extraction box standing at `spot`
-def source_spot(spot):
-    return (spot[0] - SOURCE_GAP - source_width(), spot[1])
+# where a source node stands for an extraction box standing at `spot`: its
+# right side the gap off that box, however wide it is
+def source_spot(spot, source=None):
+    return (spot[0] - SOURCE_GAP - source_width(source), spot[1])
+
+# the hub's nodes of its type the project `page` has for the source `node`
+# digs from - the free water, for water pumped by Water Extractors
+def source_assigned(node, page):
+    if is_free_source(node):
+        return [FREE_WATER]
+    if page is None:
+        return []
+    return [other for other in resource_nodes_of(node.item)
+            if other is not FREE_WATER and page.uid in other.links]
 
 # Which extraction boxes get a source box: one digging up a resource the
 # hub has nodes of - or water from Water Extractors, which comes free
@@ -16066,7 +16100,8 @@ def with_sources(frame, view):
             source = node.source_node = search.Source_Node(node)
         else:
             source.recalculate()
-        source.coordinate = source_spot(node.coordinate)
+        source.wide = bool(source_assigned(source, view.project_page))
+        source.coordinate = source_spot(node.coordinate, source)
         source.layer = node.layer + 1
         nodes.append(source)
         links.append((node, source, source.item, source.rate))
@@ -16074,20 +16109,21 @@ def with_sources(frame, view):
     return dict(frame, nodes=nodes, links=links, values=values)
 
 # What a source box shows inside its border: its node's picture and
-# nothing else, filling the square on its left - faded while the project
-# has no node for it yet. Drawn over the box's ground, taking no clicks.
+# nothing else, in its middle - once the project has a node for it.
+# Drawn over the box's ground, taking no clicks.
 class SourceContent(QGraphicsItem):
     def __init__(self, box):
         super().__init__(box)
         self.box = box
         self.setAcceptedMouseButtons(Qt.NoButton)
+        if not box.wide:
+            return   # nothing to show yet: its + stands in the picture's place
         side = box.rect().height() - 2 * SOURCE_INSET
         path = source_picture(box.node.item)
         drawing = picture_drawing(path)
         self.picture = (SymbolItem(drawing[0], drawing[1], side, self) if drawing is not None
                         else PictureItem(path, side, side, self))
         self.picture.setPos(SOURCE_INSET, SOURCE_INSET)
-        self.picture.setOpacity(1.0 if box.free or box.assigned() else 0.45)
 
     def boundingRect(self):
         return QRectF()
@@ -16095,56 +16131,95 @@ class SourceContent(QGraphicsItem):
     def paint(self, painter, option, widget=None):
         pass
 
+# A source box with no node yet: a big + filling it. The box takes the
+# click, not the +; it only stands where a caret would, lit while the node
+# manager is open just as a caret is.
+SOURCE_PLUS_ARM = 0.5      # of the button's side, end to end
+SOURCE_PLUS_THICKNESS = 10
+
+class SourcePlusButton(NodeInfoButton):
+    def __init__(self, side, color, parent):
+        super().__init__(side, color, lambda: None, parent)
+        self.setAcceptHoverEvents(False)
+        self.setAcceptedMouseButtons(Qt.NoButton)
+        self.unsetCursor()
+        self.setToolTip("")
+
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(QPainter.Antialiasing)
+        color = self.color if self.open else QColor(NODE_CAPTION_COLOR)
+        if self.open:
+            ground = QColor(color)
+            ground.setAlpha(NODE_INFO_BUTTON_GROUND_ALPHA)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(ground)
+            radius = self.box.width() / 8
+            painter.drawRoundedRect(self.box, radius, radius)
+        pen = QPen(color, SOURCE_PLUS_THICKNESS)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        center = self.box.center()
+        arm = self.box.width() * SOURCE_PLUS_ARM / 2
+        painter.drawLine(QPointF(center.x() - arm, center.y()), QPointF(center.x() + arm, center.y()))
+        painter.drawLine(QPointF(center.x(), center.y() - arm), QPointF(center.x(), center.y() + arm))
+
 # A source node's box: a box of the map like any other - picked and
 # hovered the way they are, its line to its extraction one of the map's own,
-# though bolted to that extraction rather than dragged - if narrower, outlined in its resource's color and dashed
-# while the project has no node for it yet. Its caret opens the node
-# manager, in the map's info panel.
+# though bolted to that extraction rather than dragged - outlined in its
+# resource's color, and dashed while the project has no node for it yet. A click on it opens the node manager, in the map's info panel.
 class SourceBox(NodeItem):
     def __init__(self, node, view, on_click, on_move, on_caret):
-        super().__init__(source_width(), NODE_HEIGHT, node, on_click, on_move)
+        page = getattr(view, "project_page", None)
+        node.wide = bool(source_assigned(node, page))
+        super().__init__(source_width(node), NODE_HEIGHT, node, lambda node, box: on_caret(node, box), on_move)
         self.view = view
-        self.page = getattr(view, "project_page", None)
+        self.page = page
         self.free = is_free_source(node)
+        self.wide = node.wide
         self.color = QColor(resource_color(node.item))
-        pen = QPen(self.color, NODE_BORDER_WIDTH)
-        if not self.free and not self.assigned():
-            pen.setStyle(Qt.CustomDashLine)
-            pen.setDashPattern([HOME_GHOST_DASH, HOME_GHOST_DASH])
-        self.setPen(pen)
+        self.setPen(self.border_pen(NODE_BORDER_WIDTH))
         self.setBrush(QBrush(NODE_BG))
         self.texts = []
-        # the whole square at its top right, a caret as big as it
-        self.caret = GRID_SQUARE - 2 * SOURCE_INSET
-        button = NodeInfoButton(self.caret, self.color.name(), lambda: on_caret(node, self), self,
-                                NODE_INFO_CARET_HEIGHT * self.caret / NODE_INFO_BUTTON_SIZE)
-        button.setPos(self.rect().width() - GRID_SQUARE + SOURCE_INSET, SOURCE_INSET)
-        button.setToolTip("Open the node manager: which of the project's nodes this digs from, and how much")
-        self.info_button = button
-        self.texts.append(button)
+        self.info_button = None
+        if not self.wide:
+            # the whole box but its border, a + as big as it
+            side = NODE_HEIGHT - 2 * SOURCE_INSET
+            self.info_button = SourcePlusButton(side, self.color.name(), self)
+            self.info_button.setPos(SOURCE_INSET, SOURCE_INSET)
+            self.texts.append(self.info_button)
         self.texts.append(SourceContent(self))
         self.setToolTip("Water Extractors draw it anywhere on water: no node, no limit" if self.free
-                        else f"Where its {html.escape(resource_name(node.item))} is dug from")
+                        else f"Where its {html.escape(resource_name(node.item))} is dug from"
+                        + ("" if self.wide else " - click to pick the project's node"))
 
     # bolted to its extraction: never dragged by itself, whatever the lock says
     def set_locked(self, locked):
         self.setFlag(QGraphicsItem.ItemIsMovable, False)
-        self.setCursor(Qt.ArrowCursor)
+        self.setCursor(Qt.PointingHandCursor)   # a click opens its node manager
 
     def mousePressEvent(self, event):
         super().mousePressEvent(event)
-        self.setCursor(Qt.ArrowCursor)
+        self.setCursor(Qt.PointingHandCursor)
+
+    # its border `width` thick - dashed while it has no node, the dashes as
+    # long at any width: Qt reads a dash pattern in pen widths, so the heavier
+    # border of the picked box would otherwise stretch them
+    def border_pen(self, width):
+        pen = QPen(self.color, width)
+        if not self.wide:
+            dash = HOME_GHOST_DASH * NODE_BORDER_WIDTH / width
+            pen.setStyle(Qt.CustomDashLine)
+            pen.setDashPattern([dash, dash])
+        return pen
+
+    def set_selected(self, on):
+        self.setPen(self.border_pen(NODE_SELECTED_BORDER_WIDTH if on else NODE_BORDER_WIDTH))
+        self.set_glow(on)
 
     # the hub's nodes of its type the project has - the free water, for water
     # pumped by Water Extractors
     def assigned(self):
-        if self.free:
-            return [FREE_WATER]
-        if self.page is None:
-            return []
-        uid = self.page.uid
-        return [other for other in resource_nodes_of(self.node.item)
-                if other is not FREE_WATER and uid in other.links]
+        return source_assigned(self.node, self.page)
 
 
 # The node manager of water pumped by Water Extractors: the one line, the
@@ -16196,9 +16271,9 @@ def make_free_water_manager(view, marker):
 # takes from each of the project's resource nodes, shared out the way the
 # recipe manager shares an item between recipes. A line a node - picked in
 # its dropdown, its rate typed beside it - a bar of them against what the
-# box needs, and Apply to hand it to the hub. A new node can be added from
-# it too; it is made on the hub as it is applied. What the nodes do not give
-# is left to the planner's own miners.
+# box needs, and Apply to hand it to the hub. It only picks among the nodes
+# the hub has: a new one is made on the hub, never here. What the nodes do
+# not give is left to the planner's own miners.
 def make_source_manager(view, marker):
     if is_free_source(marker):
         return make_free_water_manager(view, marker)
@@ -16259,6 +16334,7 @@ def make_source_manager(view, marker):
         f"QPushButton:hover {{ background-color: {TAB_SYMBOL_HOVER_BG}; color: {TAB_SELECTED_COLOR};"
         f" border: 1px dashed {TAB_INDICATOR_COLOR}; }}"
         f"QPushButton:pressed {{ background-color: {TAB_SYMBOL_PRESS_BG}; }}"
+        f"QPushButton:disabled {{ color: {TEXT_FAINT}; border-color: {PANEL_DIVIDER_COLOR}; font-weight: normal; }}"
     )
     layout.addWidget(add_button)
     layout.addWidget(make_panel_divider())
@@ -16314,8 +16390,7 @@ def make_source_manager(view, marker):
     buttons.addWidget(apply_button, 1)
     layout.addLayout(buttons)
 
-    # the draft: [{"node": ResourceNode, or None for a new one, "purity" of
-    # a new one, "rate", "field"}]
+    # the draft: [{"node": ResourceNode, "rate", "field"}]
     item = marker.item
     state = {"applied": [], "total": 0.0, "draft": []}
 
@@ -16339,18 +16414,19 @@ def make_source_manager(view, marker):
         return [(number, node) for number, node in enumerate(resource_nodes_of(item), 1)
                 if node is not FREE_WATER]
 
+    # the draft's lines on nodes the hub still has: one deleted there since
+    # it was picked is dropped, its rate left to the miners
+    def prune():
+        alive = {id(node) for _, node in numbered()}
+        state["draft"] = [line for line in state["draft"] if id(line["node"]) in alive]
+        state["applied"] = [(node, rate) for node, rate in state["applied"] if id(node) in alive]
+
     def capacity_of(line):
-        if line["node"] is not None:
-            return line["node"].capacity()
-        return extraction_rate(item, default_extractor(item)) * RESOURCE_PURITY_SHARE[line["purity"]]
+        return line["node"].capacity()
 
     # its number alone, for its dropdown - the rest in its tooltip, and in
     # the list a node is added from
     def label_of(line, full=False):
-        if line["node"] is None:
-            if not full:
-                return "New node"
-            return f"New {line['purity'].capitalize()} node \u00b7 {rate_text(item, capacity_of(line))}"
         number = next(number for number, node in numbered() if node is line["node"])
         if not full:
             return f"#{number}"
@@ -16362,12 +16438,11 @@ def make_source_manager(view, marker):
         return line["rate"] > capacity_of(line) + tolerance()
 
     def effective(lines):
-        return sorted((id(node) if node is not None else f"new-{purity}-{index}", round(rate, OUTPUT_RATE_MAX_DECIMALS))
-                      for index, (node, purity, rate) in enumerate(lines) if rate > tolerance())
+        return sorted((id(node), round(rate, OUTPUT_RATE_MAX_DECIMALS)) for node, rate in lines if rate > tolerance())
 
     def changed():
-        draft = [(line["node"], line.get("purity"), line["rate"]) for line in state["draft"]]
-        return effective(draft) != effective([(node, None, rate) for node, rate in state["applied"]])
+        draft = [(line["node"], line["rate"]) for line in state["draft"]]
+        return effective(draft) != effective(state["applied"])
 
     def show_status():
         total, taken = state["total"], given()
@@ -16398,6 +16473,12 @@ def make_source_manager(view, marker):
                                 else "A rate is past what its node gives, or past what is needed")
         reset_button.setEnabled(dirty)
         reset_button.setIcon(symbol_icon(draw_build_cancel, TEXT_MUTED if dirty else TEXT_FAINT))
+        # nothing left to pick: more nodes are made on the hub
+        free = bool(unused())
+        add_button.setEnabled(free)
+        add_button.setText("+  Add a node" if free else "No other node: add one in the hub")
+        add_button.setToolTip("Take from another of the project's nodes" if free
+                              else "Nodes are made in the hub, on the Resources page")
         for line in state["draft"]:
             field = line.get("field")
             if field is not None:
@@ -16406,7 +16487,7 @@ def make_source_manager(view, marker):
                 field.style().polish(field)
 
     def unused(keep=None):
-        taken = {id(line["node"]) for line in state["draft"] if line["node"] is not None and line is not keep}
+        taken = {id(line["node"]) for line in state["draft"] if line is not keep}
         return [node for _, node in numbered() if id(node) not in taken]
 
     def make_line(index, line):
@@ -16435,11 +16516,7 @@ def make_source_manager(view, marker):
             f"  selection-background-color: {SELECTION_BG}; selection-color: {TAB_SELECTED_COLOR};"
             "}"
         )
-        choices = [line["node"]] if line["node"] is not None else []
-        choices += [node for node in unused(keep=line) if node is not line["node"]]
-        if line["node"] is None:
-            combo.addItem(label_of(line), None)
-            combo.setItemData(0, label_of(line, full=True), Qt.ToolTipRole)
+        choices = [line["node"]] + [node for node in unused(keep=line) if node is not line["node"]]
         for node in choices:
             combo.addItem(label_of({"node": node}), node)
             combo.setItemData(combo.count() - 1, label_of({"node": node}, full=True), Qt.ToolTipRole)
@@ -16489,6 +16566,7 @@ def make_source_manager(view, marker):
         return row
 
     def show_lines():
+        prune()
         while lines_layout.count():
             entry = lines_layout.takeAt(0)
             if entry.widget() is not None:
@@ -16513,8 +16591,8 @@ def make_source_manager(view, marker):
             QTimer.singleShot(0, redraw)
 
     # added for what is still left - as much as it gives, at most
-    def add(node=None, purity="normal"):
-        line = {"node": node, "purity": purity, "rate": 0.0}
+    def add(node):
+        line = {"node": node, "rate": 0.0}
         line["rate"] = min(max(state["total"] - given(), 0.0), capacity_of(line))
         state["draft"].append(line)
         redraw()
@@ -16538,33 +16616,26 @@ def make_source_manager(view, marker):
         for node in unused():
             menu.addAction(label_of({"node": node}, full=True),
                            lambda node=node: QTimer.singleShot(0, lambda: add(node)))
-        if menu.actions():
-            menu.addSeparator()
-        for purity in RESOURCE_PURITIES:
-            menu.addAction(label_of({"node": None, "purity": purity}, full=True),
-                           lambda purity=purity: QTimer.singleShot(0, lambda: add(None, purity)))
         menu.setMinimumWidth(add_button.width())
         menu.exec(add_button.mapToGlobal(QPoint(0, add_button.height() + 2)))
 
     def reset():
-        state["draft"] = [{"node": node, "purity": node.purity, "rate": rate} for node, rate in state["applied"]]
+        state["draft"] = [{"node": node, "rate": rate} for node, rate in state["applied"]]
         redraw()
 
-    # handed to the hub: the nodes of the draft linked at their rates - a new
-    # one made there first - and every other node of the type let go of. The
+    # handed to the hub: the nodes of the draft linked at their rates, and
+    # every other node of the type let go of. The
     # map is drawn again, this panel with it.
     def apply():
         if not apply_button.isEnabled() or page is None:
             return
+        prune()
         uid = page.uid
         kept = set()
         for line in state["draft"]:
             node = line["node"]
             if line["rate"] <= tolerance():
                 continue
-            if node is None:
-                node = ResourceNode(item, line["purity"])
-                RESOURCES["nodes"].append(node)
             node.links.add(uid)
             node.rates[uid] = line["rate"]
             kept.add(id(node))
@@ -16597,7 +16668,7 @@ def make_source_manager(view, marker):
     uid = page.uid if page is not None else None
     state["applied"] = [(node, node.wanted(uid)) for _, node in numbered() if uid in node.links]
     needed.setText(rate_text(item, state["total"]))
-    state["draft"] = [{"node": node, "purity": node.purity, "rate": rate} for node, rate in state["applied"]]
+    state["draft"] = [{"node": node, "rate": rate} for node, rate in state["applied"]]
     show_lines()
     show_status()
     return panel
@@ -17627,8 +17698,8 @@ RESOURCE_CHEVRON = 22                        # the arrow saying which way a type
 RESOURCE_STRIP_WIDTH = GRID_STEP * 2         # the strip down a type's right side that opens its nodes
 RESOURCE_STRIP_HOVER = QColor(255, 255, 255, 20)
 RESOURCE_STRIP_DIVIDER = QColor(255, 255, 255, 30)
-RESOURCE_LINE_WIDTH = 3                      # px on screen, however far in
-RESOURCE_LINE_LIT_WIDTH = 5                  # px: a picked node's lines, brought up...
+RESOURCE_LINE_WIDTH = NODE_LINE_WIDTH        # on the map, zooming with it like any line
+RESOURCE_LINE_LIT_WIDTH = NODE_LINE_WIDTH + 2   # a picked node's lines, brought up...
 RESOURCE_LINE_LIT_LIGHTER = 150              # ...and brighter, its arrows with it
 RESOURCE_SHORT_COLOR = POWER_DRAWN_COLOR     # a type asked for more than its nodes give
 RESOURCE_LEVEL_TOP = 296                     # a node's usage bar, marked at each extractor level
@@ -18059,6 +18130,13 @@ def node_card_edge(card, painter, scale):
         return screen_pen(painter, QPen(QColor(resource_color(card.node.item)), NODE_BORDER_WIDTH), scale)
     return screen_pen(painter, QPen(QColor(OUTPUT_FIELD_BORDER), 2), scale)
 
+# an extractor as a node card's chip names it: short enough to sit beside
+# the purity and the clock - the well's extractor is just the well
+EXTRACTOR_CHIP_NAMES = {"Resource Well Extractor": "Resource Well"}
+
+def extractor_chip_name(machine):
+    return EXTRACTOR_CHIP_NAMES.get(machine.display_name, machine.display_name)
+
 class ResourceNodeCardItem(HomeCardItem):
     # `feeds` are the names of the projects it feeds; `on_menu(what, point)`
     # drops the choices for "purity", "extractor" or "feeds" at a screen point
@@ -18078,7 +18156,8 @@ class ResourceNodeCardItem(HomeCardItem):
         inner = self.rect().width() - 2 * HOME_CARD_PAD
         purity = node.purity.capitalize()
         clock = f"{round(shard_clock(node.shards) * 100)}%"
-        words = [purity, node.extractor.display_name, clock]
+        extractor = extractor_chip_name(node.extractor)
+        words = [purity, extractor, clock]
 
         # the three of them on the one row, whole: their words as big as
         # lets all three fit across the card
@@ -18102,7 +18181,7 @@ class ResourceNodeCardItem(HomeCardItem):
             left += width + RESOURCE_CHIP_GAP
         self.purity_chip = ResourceChipItem(boxes[0], purity, RESOURCE_PURITY_COLORS[node.purity],
                                             lambda at: on_menu("purity", at), "Change its purity", self, size)
-        self.extractor_chip = ResourceChipItem(boxes[1], node.extractor.display_name, TEXT_NORMAL,
+        self.extractor_chip = ResourceChipItem(boxes[1], extractor, TEXT_NORMAL,
                                                lambda at: on_menu("extractor", at),
                                                "Change the extractor on it", self, size)
         # how far it is overclocked, by the power shards in it - in blue once it is
@@ -18110,14 +18189,6 @@ class ResourceNodeCardItem(HomeCardItem):
                                            lambda at: on_menu("shards", at),
                                            f"Overclock: {node.shards} power shard{'' if node.shards == 1 else 's'}",
                                            self, size)
-        # the projects it feeds, said and nothing more: a project picks its
-        # nodes in its own map, from the box digging it up
-        feeding = ("Feeds " + ", ".join(feeds)) if feeds else "Feeds no project"
-        third = QRectF(HOME_CARD_PAD, RESOURCE_CHIP_TOP + RESOURCE_CHIP_HEIGHT + RESOURCE_CHIP_GAP,
-                       inner, RESOURCE_CHIP_HEIGHT)
-        self.feeds_chip = ResourceChipItem(third, feeding, TEXT_NORMAL if feeds else TEXT_MUTED, None,
-                                           "The projects it feeds - picked in each project's map, "
-                                           "from the box digging it up", self)
         self.setToolTip(f"<b>{html.escape(resource_name(node.item))} node {number}</b><br>"
                         f"{purity}, {html.escape(node.extractor.display_name)}<br>"
                         f"Gives {rate_text(node.item, node.capacity())}, {rate_text(node.item, used)} of it used")
@@ -18321,7 +18392,6 @@ class ResourceLineItem(QGraphicsPathItem):
         self.source = source       # the type's or node's card, at the bottom end
         self.color = QColor(resource_color(item))
         pen = QPen(self.color, RESOURCE_LINE_WIDTH)
-        pen.setCosmetic(True)
         pen.setCapStyle(Qt.FlatCap)   # it starts at its arrow's tip, flush
         self.setPen(pen)
         self.setZValue(0.2)
@@ -18345,15 +18415,26 @@ class ResourceLineItem(QGraphicsPathItem):
         self.setZValue(0.3 if lit else 0.2)
 
     # from `top`, a port along the project's bottom, down to `bottom`, one
-    # along the card's top - where its arrow stands: the line leaves from
-    # the arrow's tip
+    # along the card's top - where its arrow stands: the line runs on into
+    # the arrow down to its base, under it, so the arrow widens straight out
+    # of the line rather than its tip standing off a flat end
     def set_ends(self, top, bottom):
         self.arrow.setPolygon(border_arrow_points(bottom.x(), bottom.y(), True))
-        start = QPointF(bottom.x(), bottom.y() - border_arrow_reach())
-        pull = max((start.y() - top.y()) / 2, GRID_SQUARE / 2)
+        tip = bottom.y() - border_arrow_reach()
+        start = QPointF(bottom.x(), bottom.y() - border_arrow_step())
+        pull = max((tip - top.y()) / 2, GRID_SQUARE / 2)
         path = QPainterPath(top)
-        path.cubicTo(QPointF(top.x(), top.y() + pull), QPointF(start.x(), start.y() - pull), start)
+        # the curve down to the tip, then straight on inside the arrow
+        path.cubicTo(QPointF(top.x(), top.y() + pull), QPointF(start.x(), tip - pull), QPointF(start.x(), tip))
+        path.lineTo(start)
         self.setPath(path)
+
+    # never thinner than a line can be seen, however far out (see screen_pen)
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(screen_pen(painter, self.pen()))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawPath(self.path())
 
 
 # what the hub's power node reads: the whole grid - every project's net,
@@ -18587,6 +18668,15 @@ class HomePage(QWidget):
                 if card is not None:
                     spots[card] = QPointF(x, 0.0)
                 x += (card.rect().width() if card is not None else HOME_CARD_WIDTH) + HOME_CARD_GAP_X
+        # the row centered on the hub's vertical axis: its cards, as the power
+        # node over them reads them - the labels go along without counting
+        standing = [(card, spot) for card, spot in spots.items() if card is not self.ghost] or list(spots.items())
+        if standing:
+            left = min(spot.x() for _, spot in standing)
+            right = max(spot.x() + card.rect().width() for card, spot in standing)
+            shift = QPointF(-(left + right) / 2, 0.0)
+            spots = {card: spot + shift for card, spot in spots.items()}
+            labels = [spot + shift for spot in labels]
         hub = self.hub_spot(spots)   # over the projects alone
         self.resource_layout(spots)
         return spots, labels, hub
@@ -18598,9 +18688,8 @@ class HomePage(QWidget):
         top = HOME_PROJECT_HEIGHT + RESOURCE_SECTION_GAP
         y = top
         x = 0.0
-        label = items.get(("label",))
-        if label is not None:
-            spots[label] = QPointF(-label.rect().width() - HOME_PAGE_LABEL_GAP, y)   # before the first type
+        row = {}      # the cards of the row, as it is laid out from 0
+        right = 0.0   # where its last card, or the strip of its last open type, ends
         for item in RESOURCES["types"]:
             keys = [("type", item.full_name)]
             if item in RESOURCES["expanded"]:
@@ -18608,14 +18697,24 @@ class HomePage(QWidget):
             for key in keys:
                 card = items.get(key)
                 if card is not None:
-                    spots[card] = QPointF(x, y)
+                    row[card] = QPointF(x, y)
+                    right = x + card.rect().width()
                     x += card.rect().width() + RESOURCE_NODE_GAP
             if item in RESOURCES["expanded"]:
                 # its strip, gone out to the right end of its frame - and the
                 # next type clear of that frame
+                right = x + RESOURCE_STRIP_WIDTH
                 x += RESOURCE_STRIP_WIDTH + RESOURCE_TYPE_GAP
             else:
                 x += RESOURCE_TYPE_GAP - RESOURCE_NODE_GAP   # the next type clear of this one
+        # centered on the hub's vertical axis, as the projects over it are
+        shift = -right / 2
+        for card, spot in row.items():
+            spots[card] = QPointF(spot.x() + shift, spot.y())
+        label = items.get(("label",))
+        if label is not None:
+            # before the first type
+            spots[label] = QPointF(shift - label.rect().width() - HOME_PAGE_LABEL_GAP, y)
 
     # Where the power node stands: centered over every card and HOME_HUB_GAP
     # clear of the highest, the way a project's rides over its machines (see
@@ -18835,6 +18934,14 @@ class HomePage(QWidget):
                 card.setPos(resource_was[key])
                 continue
             start_at = spots[card]
+            ghost_key = ("node_ghost", card.node.item.full_name) if key[0] == "node" else None
+            if ghost_key in resource_was:
+                # a node just made on a type already open: it comes in where
+                # its "New node" card stood, that card stepping on out of its
+                # way - not out from under the type, across every other node
+                card.setPos(resource_was[ghost_key])
+                arriving.append(card)
+                continue
             if key[0] in ("node", "node_ghost"):
                 # tucked in behind its type's card, against its right side,
                 # to slide out from under it
@@ -19505,12 +19612,19 @@ def make_canvas():
     # the resource nodes it has changed: its extraction boxes stood on them again
     def sites_changed():
         steps = getattr(graphics_view, "build_steps", None)
+        page = getattr(graphics_view, "project_page", None)
+        # the info panel standing open - a source's node manager, say -
+        # opened again where it was on the map drawn again
+        opened_on = getattr(graphics_view, "info_node", lambda: None)()
+        spot = (graphics_view.info_spot() if opened_on is not None and graphics_view.info_was_dragged()
+                else None)
+        if page is not None and getattr(page, "sites_drawn", None) == sites_key(page):
+            # none of its own nodes changed: its map stands as it is - though
+            # a node manager open on it lists the hub's nodes, which did
+            if isinstance(opened_on, search.Source_Node):
+                graphics_view.open_node_info(opened_on, spot)
+            return
         if steps:
-            # the info panel standing open - a source's node manager, say -
-            # opened again where it was on the map drawn again
-            opened_on = getattr(graphics_view, "info_node", lambda: None)()
-            spot = (graphics_view.info_spot() if opened_on is not None and graphics_view.info_was_dragged()
-                    else None)
             restand_extractions(getattr(graphics_view, "project_page", None), steps)
             apply_extra(steps, project_extra(steps))
             redraw_graph()

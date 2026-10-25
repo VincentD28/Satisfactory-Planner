@@ -1406,6 +1406,22 @@ class Manual_Node(Node):
         self.rate = asked if any(entry["to"] for entry in self.products) else self.needed_rate
         self.products = [flow_entry(self.products, self.item, self.rate, "to")]
 
+# Where an extraction box digs its item from, as the project map draws it:
+# a box left of it, feeding it what it is asked for. It is no part of the
+# tree - the map adds it on top (see with_sources in the interface) - so it
+# is not linked into anything, only kept on its extraction.
+class Source_Node(Node):
+    def __init__(self, extraction):
+        super().__init__()
+        self.extraction = extraction
+        self.item = extraction.needed_item
+        self.picture = self.item.picture
+        self.recalculate()
+
+    def recalculate(self):
+        self.rate = self.extraction.needed_rate
+        self.products = [{"item": self.item, "rate": self.rate, "to": {self.extraction: self.rate}}]
+
 class Recipe_Node(Node):
     # `recipe` is one of the item's own recipes to run; None takes the first,
     # the item's default
@@ -1425,7 +1441,11 @@ class Recipe_Node(Node):
         else:
             self.machine = self.recipe.machine[0]
             self.duration = self.recipe.duration
-        
+        # the machine it runs in on no node of the hub's: an extraction stood
+        # on nodes shows theirs instead (see stand_on_sites), and goes back to
+        # this one once they are taken off it - or deleted
+        self.own_machine = self.machine
+
         self.item_picture = needed_item.picture
         self.machine_picture = self.machine.picture
 
@@ -1525,6 +1545,8 @@ class Recipe_Node(Node):
         self.full_machines = int(self.machine_nb)
         self.last_machine_clock = self.machine_nb - self.full_machines
         self.machine_built = self.full_machines + (1 if self.last_machine_clock else 0)
+        self.machine = self.own_machine
+        self.machine_picture = self.machine.picture
         self.needed_power = power_for(self, self.machine_nb)
         self.stand_on_sites()
 
